@@ -1,3 +1,5 @@
+If you OOM on https://github.com/naxci1/ComfyUI-FlashVSR_Stable or https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast then try this, it works great on RTX 4050 6GB VRAM 16GB RAM.
+
 # ComfyUI FlashVSR — Stock Wan
 
 FlashVSR v1.1 video super-resolution built around ComfyUI's stock Wan model,
