@@ -10,7 +10,7 @@ This project is intended for users who want FlashVSR as a composable ComfyUI
 workflow rather than an all-in-one pipeline. The FlashVSR-specific pieces are
 implemented as custom nodes: LQ projection, block-0 conditioning, the one-step
 streaming sampler, the Tiny Conditional Decoder, postprocessing, and an
-optional SpargeAttn route for LCSA.
+optional SpargeAttn route for LCSA. ComfyUI stock nodes are used wherever possible.
 
 > [!IMPORTANT]
 > This is an independent community implementation, not the official FlashVSR
@@ -72,7 +72,7 @@ Restart ComfyUI after installation.
 
 ## Models
 
-Download the safetensors from
+You can use the files I hosted
 [pizzawookiee/FlashVSR-1.1](https://huggingface.co/pizzawookiee/FlashVSR-1.1/tree/main) and place
 the FlashVSR-specific files in:
 
@@ -80,18 +80,17 @@ the FlashVSR-specific files in:
 ComfyUI/
 └── models/
     └── flashvsr/
-        ├── FlashVSR1_1.safetensors
+        ├── FlashVSR1_1-int8_convrot.safetensors.safetensors
         ├── LQ_proj_in.safetensors
         ├── Prompt.safetensors
-        └── TCDecoder.safetensors
+        └── TCDecoder-fp16.safetensors
 ```
 
 The loaders match component names rather than requiring those exact filenames,
-so compatible dtype-converted files such as `FlashVSR1_1-int8_convrot.safetensors`
-or `TCDecoder-fp16.safetensors` can also appear in the menus.
+so you can probably reuse your old safetensors FlashVSR files if you make sure that `FlashVSR1_1` is in the filename for example. 
 
 The Wan 2.1 VAE is not FlashVSR-specific in this implementation. Put it in the
-usual ComfyUI VAE directory and load it with ComfyUI's stock VAE loader:
+usual ComfyUI VAE directory, load it with ComfyUI's stock VAE loader and you can use stock ComfyUI VAE decode rather than TCDecoder:
 
 ```text
 ComfyUI/models/vae/Wan2.1_VAE.safetensors
@@ -140,7 +139,7 @@ The intended graph is:
    `SamplerCustomAdvanced`. The provided sampler owns the one-step streaming
    logic; a regular stock sampler cannot replace it.
 7. Decode with either `FlashVSR Tiny Decode` or ComfyUI's stock Wan VAE.
-8. Run `FlashVSR Postprocess` to remove right/bottom alignment padding and
+8. Run `FlashVSR Postprocess` for color correction and to remove right/bottom alignment padding and
    optional temporal padding, then create/save the output video.
 
 The initial latent is created by `Prepare Video for FlashVSR`. It has the
@@ -203,7 +202,7 @@ recommended quality-equivalent replacement for `streaming` LCSA.
 
 Confirm that the files are `.safetensors`, restart ComfyUI, and place all
 FlashVSR-specific weights under lowercase `ComfyUI/models/flashvsr`. Load the
-Wan VAE through the stock VAE loader from `ComfyUI/models/vae`.
+Wan VAE through the stock VAE loader; that VAE should reside in the usual `ComfyUI/models/vae`.
 
 ### Out of memory
 
@@ -217,7 +216,7 @@ still require memory.
 
 Streaming dense fallback requires a backend that accepts an arbitrary
 per-head attention mask. Switch `ModelAttentionBackend` to a compatible mode,
-or install and use the optional FlashVSR Sparge patch.
+or use the optional FlashVSR Sparge node included in this repo.
 
 ### First run is slower
 
