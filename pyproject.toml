@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-flashvsr-stock"
-description = "FlashVSR v1.1 video super-resolution built around ComfyUI's stock Wan implementation."
+description = "FlashVSR v1.1 video super-resolution using ComfyUI's stock Wan implementation."
 version = "0.20.0"
 license = { file = "LICENSE.txt" }
 requires-python = ">=3.10"
