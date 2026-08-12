@@ -1,0 +1,943 @@
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+import comfy.model_management as model_management
+import comfy.model_patcher
+import comfy.ops
+import comfy.utils
+
+
+CACHE_T = 2
+
+
+def _component_dtype(name: str, device: torch.device) -> torch.dtype:
+    if name == "fp32":
+        return torch.float32
+    if name == "fp16":
+        return torch.float16
+    if name == "bf16":
+        return torch.bfloat16
+    if model_management.should_use_bf16(device):
+        return torch.bfloat16
+    if model_management.should_use_fp16(device):
+        return torch.float16
+    return torch.float32
+
+
+def _state_dtype(sd: dict[str, torch.Tensor]) -> torch.dtype:
+    for value in sd.values():
+        if torch.is_tensor(value) and value.is_floating_point():
+            return value.dtype
+    return torch.float32
+
+
+class ManagedComponent(nn.Module):
+    def __init__(self, compute_dtype: torch.dtype):
+        super().__init__()
+        self.compute_dtype = compute_dtype
+        self.manual_cast_dtype = compute_dtype
+
+    def get_dtype(self):
+        return self.compute_dtype
+
+
+@dataclass
+class ComponentHandle:
+    model: ManagedComponent
+    patcher: comfy.model_patcher.ModelPatcher
+    compute_dtype: torch.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.patcher.load_device
+
+    def cleanup(self):
+        if hasattr(self.model, "clear_cache"):
+            self.model.clear_cache()
+        if hasattr(self.model, "clean_mem"):
+            self.model.clean_mem()
+
+
+class ChannelRMSNorm(nn.Module):
+    """FlashVSR's channel-first RMS normalization.
+
+    This stays custom because torch/comfy RMSNorm normalizes the final axis,
+    while FlashVSR normalizes channel axis 1 of a BCFHW tensor.
+    """
+
+    def __init__(self, dim: int, device=None, dtype=None):
+        super().__init__()
+        self.scale = dim**0.5
+        self.gamma = nn.Parameter(torch.ones((dim, 1, 1, 1), device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gamma = self.gamma.to(device=x.device, dtype=x.dtype)
+        return F.normalize(x, dim=1) * self.scale * gamma
+
+
+class PixelUnshuffle3D(nn.Module):
+    def __init__(self, temporal: int, height: int, width: int):
+        super().__init__()
+        self.temporal = temporal
+        self.height = height
+        self.width = width
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        remainder = x.shape[2] % self.temporal
+        if remainder:
+            pad_frames = self.temporal - remainder
+            x = torch.cat((x[:, :, :1].repeat(1, 1, pad_frames, 1, 1), x), dim=2)
+        return rearrange(
+            x,
+            "b c (f ft) (h ph) (w pw) -> b (c ft ph pw) f h w",
+            ft=self.temporal,
+            ph=self.height,
+            pw=self.width,
+        )
+
+
+def _causal_conv_class(operations):
+    class CausalConv3d(operations.Conv3d):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._causal_padding = (
+                self.padding[2], self.padding[2],
+                self.padding[1], self.padding[1],
+                2 * self.padding[0], 0,
+            )
+            self.padding = (0, 0, 0)
+
+        def forward(self, x: torch.Tensor, cache_x: Optional[torch.Tensor] = None):
+            padding = list(self._causal_padding)
+            if cache_x is not None and padding[4] > 0:
+                cache_x = cache_x.to(device=x.device, dtype=x.dtype)
+                x = torch.cat((cache_x, x), dim=2)
+                padding[4] = max(0, padding[4] - cache_x.shape[2])
+            x = F.pad(x, padding, mode="replicate")
+            return super().forward(x)
+
+    return CausalConv3d
+
+
+class LQProjector(ManagedComponent):
+    def __init__(self, operations, compute_dtype, device=None, weight_dtype=None):
+        super().__init__(compute_dtype)
+        CausalConv3d = _causal_conv_class(operations)
+        self.pixel_shuffle = PixelUnshuffle3D(1, 16, 16)
+        self.conv1 = CausalConv3d(
+            3 * 16 * 16, 2048, (4, 3, 3), stride=(2, 1, 1), padding=(1, 1, 1),
+            device=device, dtype=weight_dtype,
+        )
+        self.norm1 = ChannelRMSNorm(2048, device=device, dtype=weight_dtype)
+        self.act1 = nn.SiLU()
+        self.conv2 = CausalConv3d(
+            2048, 3072, (4, 3, 3), stride=(2, 1, 1), padding=(1, 1, 1),
+            device=device, dtype=weight_dtype,
+        )
+        self.norm2 = ChannelRMSNorm(3072, device=device, dtype=weight_dtype)
+        self.act2 = nn.SiLU()
+        # The released v1.1 checkpoint has one projection and conditions block 0.
+        self.linear_layers = nn.ModuleList([
+            operations.Linear(3072, 1536, device=device, dtype=weight_dtype)
+        ])
+        self.clear_cache()
+
+    def clear_cache(self):
+        self.cache = {"conv1": None, "conv2": None}
+        self.clip_idx = 0
+
+    def _store_causal_tail(self, key: str, source: torch.Tensor):
+        """Retain only the compact causal tail and reuse it when possible."""
+        tail = source[:, :, -CACHE_T:].detach()
+        stored = self.cache[key]
+        if (
+            stored is not None
+            and stored.shape == tail.shape
+            and stored.device == tail.device
+            and stored.dtype == tail.dtype
+        ):
+            stored.copy_(tail)
+        else:
+            # A detached slice would retain the complete source allocation.
+            # Clone exactly the two causal frames into an owning buffer.
+            self.cache[key] = tail.clone()
+
+    def stream_forward(self, video_clip: torch.Tensor, profiler=None):
+        input_marker = (
+            profiler.profile_start(video_clip)
+            if profiler is not None else None
+        )
+        video_clip = video_clip.to(dtype=self.compute_dtype)
+        if profiler is not None:
+            profiler.profile_end("lq_input_cast", input_marker)
+        if self.clip_idx == 0:
+            pixel_marker = (
+                profiler.profile_start(video_clip)
+                if profiler is not None else None
+            )
+            first = video_clip[:, :, :1].repeat(1, 1, 3, 1, 1)
+            x = self.pixel_shuffle(torch.cat((first, video_clip), dim=2))
+            if profiler is not None:
+                profiler.profile_end("lq_pixel_unshuffle", pixel_marker)
+            # FlashVSR v1.1 uses causal projector state: convolve with the
+            # previous clip's cache, then retain the current tail for the
+            # following clip. The first clip therefore uses causal replicate
+            # padding rather than feeding its own final frames back as history.
+            cache1_source = x
+            conv1_marker = (
+                profiler.profile_start(x) if profiler is not None else None
+            )
+            x = self.conv1(x, self.cache["conv1"])
+            if profiler is not None:
+                profiler.profile_end("lq_conv1", conv1_marker)
+            norm1_marker = (
+                profiler.profile_start(x) if profiler is not None else None
+            )
+            x = self.act1(self.norm1(x))
+            if profiler is not None:
+                profiler.profile_end("lq_norm_act1", norm1_marker)
+            cache_marker = (
+                profiler.profile_start(x) if profiler is not None else None
+            )
+            self._store_causal_tail("conv1", cache1_source)
+            self._store_causal_tail("conv2", x)
+            if profiler is not None:
+                profiler.profile_end("lq_cache_update", cache_marker)
+            del cache1_source
+            self.clip_idx += 1
+            return None
+
+        pixel_marker = (
+            profiler.profile_start(video_clip)
+            if profiler is not None else None
+        )
+        x = self.pixel_shuffle(video_clip)
+        if profiler is not None:
+            profiler.profile_end("lq_pixel_unshuffle", pixel_marker)
+        cache1_source = x
+        conv1_marker = (
+            profiler.profile_start(x) if profiler is not None else None
+        )
+        x = self.conv1(x, self.cache["conv1"])
+        if profiler is not None:
+            profiler.profile_end("lq_conv1", conv1_marker)
+        norm1_marker = (
+            profiler.profile_start(x) if profiler is not None else None
+        )
+        x = self.act1(self.norm1(x))
+        if profiler is not None:
+            profiler.profile_end("lq_norm_act1", norm1_marker)
+        cache1_marker = (
+            profiler.profile_start(x) if profiler is not None else None
+        )
+        self._store_causal_tail("conv1", cache1_source)
+        if profiler is not None:
+            profiler.profile_end("lq_cache_update", cache1_marker)
+        del cache1_source
+        cache2_source = x
+        conv2_marker = (
+            profiler.profile_start(x) if profiler is not None else None
+        )
+        x = self.conv2(x, self.cache["conv2"])
+        if profiler is not None:
+            profiler.profile_end("lq_conv2", conv2_marker)
+        norm2_marker = (
+            profiler.profile_start(x) if profiler is not None else None
+        )
+        x = self.act2(self.norm2(x))
+        if profiler is not None:
+            profiler.profile_end("lq_norm_act2", norm2_marker)
+        cache2_marker = (
+            profiler.profile_start(x) if profiler is not None else None
+        )
+        self._store_causal_tail("conv2", cache2_source)
+        if profiler is not None:
+            profiler.profile_end("lq_cache_update", cache2_marker)
+        del cache2_source
+        tokens = rearrange(x, "b c f h w -> b (f h w) c")
+        self.clip_idx += 1
+        linear_marker = (
+            profiler.profile_start(tokens)
+            if profiler is not None else None
+        )
+        output = [layer(tokens) for layer in self.linear_layers]
+        if profiler is not None:
+            profiler.profile_end("lq_linear", linear_marker)
+        return output
+
+
+class Clamp(nn.Module):
+    def forward(self, x):
+        return torch.tanh(x / 3) * 3
+
+
+class MemBlock(nn.Module):
+    def __init__(self, operations, n_in, n_out, device=None, dtype=None):
+        super().__init__()
+        conv = lambda a, b, **kw: operations.Conv2d(a, b, 3, padding=1, device=device, dtype=dtype, **kw)
+        self.conv = nn.Sequential(
+            conv(n_in * 2, n_out), nn.ReLU(inplace=True),
+            conv(n_out, n_out), nn.ReLU(inplace=True),
+            conv(n_out, n_out),
+        )
+        self.skip = operations.Conv2d(n_in, n_out, 1, bias=False, device=device, dtype=dtype) if n_in != n_out else nn.Identity()
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x, past):
+        return self.act(self.conv(torch.cat((x, past), dim=1)) + self.skip(x))
+
+
+class TGrow(nn.Module):
+    def __init__(self, operations, channels, stride, device=None, dtype=None):
+        super().__init__()
+        self.stride = stride
+        self.conv = operations.Conv2d(channels, channels * stride, 1, bias=False, device=device, dtype=dtype)
+
+    def forward(self, x):
+        nt, channels, height, width = x.shape
+        return self.conv(x).reshape(-1, channels, height, width)
+
+
+class FusedTGrowConv(nn.Module):
+    """Compose TGrow's 1x1 projection with its following 3x3 convolution."""
+
+    def __init__(self, operations, n_in, n_out, stride,
+                 device=None, dtype=None):
+        super().__init__()
+        self.stride = int(stride)
+        self.n_out = int(n_out)
+        self.fused = operations.Conv2d(
+            n_in,
+            n_out * self.stride,
+            3,
+            padding=1,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x):
+        nt, _, height, width = x.shape
+        return self.fused(x).reshape(
+            nt * self.stride,
+            self.n_out,
+            height,
+            width,
+        )
+
+
+def _identity_conv(operations, channels, device=None, dtype=None):
+    # It is loaded from the checkpoint. Keeping the Conv2d directly in the
+    # Sequential preserves decoder.<index>.weight key compatibility.
+    layer = operations.Conv2d(channels, channels, 3, padding=1, bias=False, device=device, dtype=dtype)
+    layer.flashvsr_identity_layer = True
+    return layer
+
+
+class TCDecoder(ManagedComponent):
+    image_channels = 3
+
+    def __init__(self, operations, compute_dtype, device=None,
+                 weight_dtype=None, fuse_tgrow=False,
+                 channels_last=False):
+        super().__init__(compute_dtype)
+        channels = [512, 256, 128, 128]
+        latent_channels = 16 + 768
+        conv = lambda a, b, **kw: operations.Conv2d(a, b, 3, padding=1, device=device, dtype=weight_dtype, **kw)
+
+        base = nn.Sequential(
+            Clamp(), conv(latent_channels, channels[0]), nn.ReLU(inplace=True),
+            MemBlock(operations, channels[0], channels[0], device, weight_dtype),
+            MemBlock(operations, channels[0], channels[0], device, weight_dtype),
+            MemBlock(operations, channels[0], channels[0], device, weight_dtype),
+            nn.Upsample(scale_factor=2), TGrow(operations, channels[0], 1, device, weight_dtype),
+            conv(channels[0], channels[1], bias=False),
+            MemBlock(operations, channels[1], channels[1], device, weight_dtype),
+            MemBlock(operations, channels[1], channels[1], device, weight_dtype),
+            MemBlock(operations, channels[1], channels[1], device, weight_dtype),
+            nn.Upsample(scale_factor=2), TGrow(operations, channels[1], 2, device, weight_dtype),
+            conv(channels[1], channels[2], bias=False),
+            MemBlock(operations, channels[2], channels[2], device, weight_dtype),
+            MemBlock(operations, channels[2], channels[2], device, weight_dtype),
+            MemBlock(operations, channels[2], channels[2], device, weight_dtype),
+            nn.Upsample(scale_factor=2), TGrow(operations, channels[2], 2, device, weight_dtype),
+            conv(channels[2], channels[3], bias=False),
+            nn.ReLU(inplace=True), conv(channels[3], self.image_channels),
+        )
+        self.decoder = self._deepen(base, operations, device, weight_dtype)
+        self.fuse_tgrow = bool(fuse_tgrow)
+        self.use_channels_last = bool(channels_last)
+        if self.fuse_tgrow:
+            self._fuse_tgrow_layers(
+                operations, device=device, dtype=weight_dtype
+            )
+        self.pixel_shuffle = PixelUnshuffle3D(4, 8, 8)
+        self.frames_to_trim = 3
+        self.clean_mem()
+
+    @staticmethod
+    def _deepen(base, operations, device, dtype):
+        layers = []
+        for block in base:
+            layers.append(block)
+            if isinstance(block, nn.ReLU):
+                channels = None
+                previous = layers[-2] if len(layers) >= 2 else None
+                if isinstance(previous, nn.Conv2d):
+                    channels = previous.out_channels
+                elif isinstance(previous, MemBlock):
+                    channels = previous.conv[-1].out_channels
+                if channels is not None:
+                    layers.extend((_identity_conv(operations, channels, device, dtype), nn.ReLU(inplace=True)))
+        return nn.Sequential(*layers)
+
+    def _fuse_tgrow_layers(self, operations, device=None, dtype=None):
+        """Replace each linear TGrow->Conv2d pair without shifting keys."""
+        for index in range(len(self.decoder) - 1):
+            grow = self.decoder[index]
+            following = self.decoder[index + 1]
+            if not isinstance(grow, TGrow) or not isinstance(
+                following, nn.Conv2d
+            ):
+                continue
+            fused = FusedTGrowConv(
+                operations,
+                grow.conv.in_channels,
+                following.out_channels,
+                grow.stride,
+                device=device,
+                dtype=dtype,
+            )
+            self.decoder[index] = fused
+            # Retaining the Sequential index keeps every later released
+            # checkpoint key stable. patch_state_dict consumes the following
+            # Conv2d weight while constructing decoder.<index>.fused.weight.
+            self.decoder[index + 1] = nn.Identity()
+
+    def clean_mem(self):
+        self.mem = [None] * len(self.decoder)
+
+    def optimize_memory_format(self):
+        """Optionally keep Conv2d weights in channels-last format."""
+        if self.use_channels_last:
+            self.to(memory_format=torch.channels_last)
+
+    def _channels_last(self, x):
+        if (
+            self.use_channels_last
+            and x.ndim == 4
+            and not x.is_contiguous(
+                memory_format=torch.channels_last
+            )
+        ):
+            return x.contiguous(memory_format=torch.channels_last)
+        return x
+
+    def _clone_state(self, current):
+        memory_format = (
+            torch.channels_last
+            if self.use_channels_last
+            else torch.contiguous_format
+        )
+        return current.detach().clone(memory_format=memory_format)
+
+    @staticmethod
+    def _has_exact_storage(current):
+        """True when retaining current cannot pin a larger sibling batch."""
+        try:
+            return (
+                current.storage_offset() == 0
+                and current.untyped_storage().nbytes()
+                == current.numel() * current.element_size()
+            )
+        except (AttributeError, RuntimeError):
+            return False
+
+    def _retain_state(self, index, current):
+        """Retain one causal frame without retaining a temporal parent."""
+        if self._has_exact_storage(current):
+            self.mem[index] = current.detach()
+            return
+
+        stored = self.mem[index]
+        if (
+            stored is not None
+            and stored.shape == current.shape
+            and stored.device == current.device
+            and stored.dtype == current.dtype
+        ):
+            stored.copy_(current)
+            self.mem[index] = stored
+        else:
+            self.mem[index] = self._clone_state(current)
+
+    def _run_sequential(self, input_frame):
+        """Depth-first execution with one high-resolution branch live."""
+        pending = deque(((self._channels_last(input_frame), 0),))
+
+        while pending:
+            current, index = pending.popleft()
+            if index == len(self.decoder):
+                # Yield immediately so decode_video can stage/offload this
+                # frame before the next high-resolution branch is evaluated.
+                yield current
+                continue
+
+            block = self.decoder[index]
+            if isinstance(block, MemBlock):
+                stored = self.mem[index]
+                past = torch.zeros_like(current) if stored is None else stored
+                updated = block(current, past)
+                # Fused TGrow emits views into one multi-frame allocation.
+                # Copy those views into a compact state instead of pinning all
+                # sibling branches; transfer ownership for ordinary outputs.
+                self._retain_state(index, current)
+                pending.appendleft((self._channels_last(updated), index + 1))
+                del current, past, stored, updated
+                continue
+
+            current = self._channels_last(block(current))
+            if isinstance(block, (TGrow, FusedTGrowConv)):
+                n, channels, height, width = current.shape
+                stride = block.stride
+                grown = current.reshape(
+                    n // stride, stride, channels, height, width
+                )
+                # appendleft in reverse preserves temporal order while fully
+                # completing one branch before the next branch is evaluated.
+                for branch in range(stride - 1, -1, -1):
+                    pending.appendleft((grown[:, branch], index + 1))
+                del current, grown
+            else:
+                pending.appendleft((current, index + 1))
+
+    def _run_temporal_batch(self, inputs):
+        """Execute a bounded NTCHW group while preserving causal MemBlocks."""
+        n, temporal, channels, height, width = inputs.shape
+        current = self._channels_last(
+            inputs.reshape(n * temporal, channels, height, width)
+        )
+
+        for index, block in enumerate(self.decoder):
+            if isinstance(block, MemBlock):
+                _, channels, height, width = current.shape
+                current_nt = current.reshape(
+                    n, temporal, channels, height, width
+                )
+                stored = self.mem[index]
+                if temporal == 1:
+                    if stored is None:
+                        past = torch.zeros_like(current)
+                    else:
+                        past = stored
+                    updated = block(current, past)
+                    self._retain_state(index, current)
+                else:
+                    past = torch.empty_like(current)
+                    past_nt = past.reshape(
+                        n, temporal, channels, height, width
+                    )
+                    if stored is None:
+                        past_nt[:, 0].zero_()
+                    else:
+                        past_nt[:, 0].copy_(stored)
+                    past_nt[:, 1:].copy_(current_nt[:, :-1])
+                    updated = block(current, past)
+                    # A view of the last item would retain the complete batch.
+                    # Clone only this one bounded state at batch boundaries.
+                    self.mem[index] = self._clone_state(current_nt[:, -1])
+                current = self._channels_last(updated)
+                del updated, past, stored
+                continue
+
+            current = block(current)
+            current = self._channels_last(current)
+            if isinstance(block, (TGrow, FusedTGrowConv)):
+                temporal *= block.stride
+
+        _, channels, height, width = current.shape
+        return current.reshape(n, temporal, channels, height, width)
+
+    def patch_state_dict(self, state_dict):
+        """Accept the pre-pruning TGrow layout used by some released packs."""
+        for index, layer in enumerate(self.decoder):
+            key = f"decoder.{index}.conv.weight"
+            if isinstance(layer, TGrow):
+                if (
+                    key in state_dict
+                    and state_dict[key].shape[0] > layer.conv.weight.shape[0]
+                ):
+                    state_dict[key] = state_dict[key][
+                        -layer.conv.weight.shape[0]:
+                    ]
+                continue
+            if not isinstance(layer, FusedTGrowConv):
+                continue
+
+            following_key = f"decoder.{index + 1}.weight"
+            if key not in state_dict or following_key not in state_dict:
+                continue
+            grow_weight = state_dict[key]
+            following_weight = state_dict[following_key]
+            expected_grow_channels = (
+                layer.fused.in_channels * layer.stride
+            )
+            if grow_weight.shape[0] > expected_grow_channels:
+                grow_weight = grow_weight[-expected_grow_channels:]
+            grow_matrix = grow_weight.reshape(
+                layer.stride,
+                expected_grow_channels // layer.stride,
+                layer.fused.in_channels,
+            ).float()
+            # For each temporal branch: following_3x3 @ grow_1x1. Compose in
+            # FP32 once on CPU, then store in the decoder's native weight dtype.
+            fused_weight = torch.einsum(
+                "omhw,smi->soihw",
+                following_weight.float(),
+                grow_matrix,
+            ).reshape_as(layer.fused.weight).to(
+                device="cpu", dtype=grow_weight.dtype
+            )
+            state_dict[f"decoder.{index}.fused.weight"] = fused_weight
+            del state_dict[key], state_dict[following_key]
+        return state_dict
+
+    @torch.inference_mode()
+    def decode_video(
+        self,
+        latents_bcthw,
+        condition_bcfhw,
+        *,
+        compute_device=None,
+        compute_dtype=None,
+        latent_mean=None,
+        latent_std=None,
+        latent_scale_factor=1.0,
+        output_device=None,
+        output_dtype=None,
+        output_chunk_size=4,
+        temporal_batch_size=1,
+        frame_start=0,
+        frame_count=None,
+        output_height=None,
+        output_width=None,
+        clamp_output=False,
+    ):
+        if latents_bcthw.ndim != 5 or condition_bcfhw.ndim != 5:
+            raise ValueError(
+                "TCDecoder expects latent and conditioning video tensors "
+                "with five dimensions."
+            )
+        n, _, timesteps, _, _ = latents_bcthw.shape
+        required_condition_frames = 1 + max(0, timesteps - 1) * 4
+        if condition_bcfhw.shape[2] < required_condition_frames:
+            raise RuntimeError(
+                "TCDecoder conditioning video is too short: "
+                f"{condition_bcfhw.shape[2]} < "
+                f"{required_condition_frames}."
+            )
+
+        compute_device = (
+            latents_bcthw.device
+            if compute_device is None
+            else torch.device(compute_device)
+        )
+        compute_dtype = (
+            self.compute_dtype if compute_dtype is None else compute_dtype
+        )
+        normalized_mean = (
+            None
+            if latent_mean is None
+            else latent_mean.to(
+                device=compute_device, dtype=compute_dtype
+            )
+        )
+        normalized_std = (
+            None
+            if latent_std is None
+            else latent_std.to(
+                device=compute_device, dtype=compute_dtype
+            )
+        )
+
+        normalized_scale = (
+            None
+            if normalized_std is None
+            else float(latent_scale_factor) / normalized_std
+        )
+        if normalized_mean is not None:
+            normalized_mean = normalized_mean[:, :, 0]
+        if normalized_scale is not None:
+            normalized_scale = normalized_scale[:, :, 0]
+
+        output = []
+        trim = self.mem[-8] is None
+        selected_output = None
+        selected_index = 0
+        staged_output = None
+        staged_count = 0
+        output_chunk_size = max(1, int(output_chunk_size))
+        temporal_batch_size = max(
+            1, min(int(temporal_batch_size), timesteps)
+        )
+        produced_frames = 0
+        raw_start = (self.frames_to_trim if trim else 0) + max(
+            0, int(frame_start)
+        )
+        raw_stop = (
+            raw_start + max(0, int(frame_count))
+            if frame_count is not None
+            else None
+        )
+        finished = False
+
+        def flush_staged_output():
+            nonlocal selected_index, staged_count
+            if staged_count == 0:
+                return
+            selected_output[
+                :, selected_index:selected_index + staged_count
+            ].copy_(staged_output[:, :staged_count])
+            selected_index += staged_count
+            staged_count = 0
+
+        condition_channels = (
+            condition_bcfhw.shape[1]
+            * self.pixel_shuffle.temporal
+            * self.pixel_shuffle.height
+            * self.pixel_shuffle.width
+        )
+        latent_channels = latents_bcthw.shape[1]
+        latent_height, latent_width = latents_bcthw.shape[-2:]
+        input_buffer = torch.empty(
+            (
+                n,
+                temporal_batch_size,
+                condition_channels + latent_channels,
+                latent_height,
+                latent_width,
+            ),
+            device=compute_device,
+            dtype=compute_dtype,
+        )
+
+        for batch_start in range(0, timesteps, temporal_batch_size):
+            batch_count = min(
+                temporal_batch_size, timesteps - batch_start
+            )
+            for offset in range(batch_count):
+                timestep = batch_start + offset
+                if timestep == 0:
+                    condition_clip = condition_bcfhw[:, :, :1]
+                else:
+                    clip_start = 1 + (timestep - 1) * 4
+                    condition_clip = condition_bcfhw[
+                        :, :, clip_start:clip_start + 4
+                    ]
+                condition_t = self.pixel_shuffle(
+                    condition_clip.to(
+                        device=compute_device, dtype=compute_dtype
+                    )
+                )
+                if condition_t.shape[2] != 1:
+                    raise RuntimeError(
+                        "TCDecoder conditioning chunk did not produce "
+                        "exactly one latent timestep."
+                    )
+                current_input = input_buffer[:, offset]
+                current_input[:, :condition_channels].copy_(
+                    condition_t[:, :, 0]
+                )
+                latent_input = current_input[:, condition_channels:]
+                latent_input.copy_(
+                    latents_bcthw[:, :, timestep]
+                )
+                if (
+                    normalized_mean is not None
+                    and normalized_scale is not None
+                ):
+                    latent_input.sub_(normalized_mean).mul_(
+                        normalized_scale
+                    )
+                del condition_t, current_input, latent_input
+
+            if temporal_batch_size == 1:
+                decoded = None
+                decoded_frames = self._run_sequential(input_buffer[:, 0])
+            else:
+                decoded = self._run_temporal_batch(
+                    input_buffer[:, :batch_count]
+                )
+                decoded_frames = (
+                    decoded[:, output_index]
+                    for output_index in range(decoded.shape[1])
+                )
+            for current in decoded_frames:
+                if raw_stop is None:
+                    output.append(current)
+                elif raw_start <= produced_frames < raw_stop:
+                    frame = current
+                    if output_height is not None:
+                        frame = frame[:, :, :int(output_height)]
+                    if output_width is not None:
+                        frame = frame[:, :, :, :int(output_width)]
+                    if clamp_output:
+                        frame.clamp_(0.0, 1.0)
+                    target_device = (
+                        frame.device
+                        if output_device is None
+                        else output_device
+                    )
+                    target_dtype = (
+                        frame.dtype
+                        if output_dtype is None
+                        else output_dtype
+                    )
+                    if selected_output is None:
+                        selected_output = torch.empty(
+                            (
+                                n,
+                                int(frame_count),
+                                frame.shape[1],
+                                frame.shape[2],
+                                frame.shape[3],
+                            ),
+                            device=target_device,
+                            dtype=target_dtype,
+                        )
+                        staged_output = torch.empty(
+                            (
+                                n,
+                                min(
+                                    output_chunk_size,
+                                    int(frame_count),
+                                ),
+                                frame.shape[1],
+                                frame.shape[2],
+                                frame.shape[3],
+                            ),
+                            device=frame.device,
+                            dtype=frame.dtype,
+                        )
+                    staged_output[:, staged_count].copy_(frame)
+                    staged_count += 1
+                    if staged_count == staged_output.shape[1]:
+                        flush_staged_output()
+                    del frame
+                produced_frames += 1
+                if raw_stop is not None and produced_frames >= raw_stop:
+                    flush_staged_output()
+                    finished = True
+                    break
+            del current, decoded_frames, decoded
+            if finished:
+                break
+
+        if raw_stop is not None:
+            if selected_output is None or selected_index != int(frame_count):
+                raise RuntimeError(
+                    "TCDecoder produced an incomplete selected frame range: "
+                    f"{selected_index} of {frame_count} frames."
+                )
+            return selected_output
+        frames = torch.stack(output, dim=1)
+        return frames[:, self.frames_to_trim:] if trim else frames
+
+
+def _load_managed(
+    path,
+    component_class,
+    dtype_name: str,
+    prefix: str = "",
+    store_compute_dtype: bool = False,
+    force_manual_cast: bool = False,
+    component_kwargs=None,
+) -> ComponentHandle:
+    sd = comfy.utils.load_torch_file(path, safe_load=True)
+    if prefix:
+        sd = {key.removeprefix(prefix): value for key, value in sd.items()}
+    checkpoint_dtype = _state_dtype(sd)
+    load_device = model_management.get_torch_device()
+    offload_device = model_management.unet_offload_device()
+    compute_dtype = _component_dtype(dtype_name, load_device)
+    weight_dtype = compute_dtype if store_compute_dtype else checkpoint_dtype
+
+    # TCDecoder and the LQ projector reuse large convolution weights throughout
+    # a run. Keeping an FP32 checkpoint in ComfyUI's manual-cast path would
+    # recast those weights repeatedly. Convert each floating tensor once on CPU
+    # so CoreModelPatcher dynamically loads/offloads native compute-dtype weights.
+    # Replace entries incrementally instead of constructing a second complete
+    # state-dict mapping and retaining all FP32 tensors until conversion ends.
+    if store_compute_dtype and checkpoint_dtype != weight_dtype:
+        for key in list(sd):
+            value = sd[key]
+            if torch.is_tensor(value) and value.is_floating_point():
+                sd[key] = value.to(device="cpu", dtype=weight_dtype)
+
+    # A managed component may be offloaded between executions while the
+    # surrounding diffusion-model clone remains resident. Manual-cast ops are
+    # a safe fallback in that state: resident weights are used directly, while
+    # offloaded weights are cast/moved through ComfyUI instead of being passed
+    # as CPU tensors to a CUDA kernel.
+    operations = (
+        comfy.ops.manual_cast
+        if force_manual_cast
+        else comfy.ops.pick_operations(
+            weight_dtype, compute_dtype, load_device=load_device
+        )
+    )
+    component_kwargs = dict(component_kwargs or {})
+    model = component_class(
+        operations=operations,
+        compute_dtype=compute_dtype,
+        device=offload_device,
+        weight_dtype=weight_dtype,
+        **component_kwargs,
+    ).eval()
+    if hasattr(model, "patch_state_dict"):
+        sd = model.patch_state_dict(sd)
+    model_management.archive_model_dtypes(model)
+    patcher = comfy.model_patcher.CoreModelPatcher(model, load_device=load_device, offload_device=offload_device)
+    missing, unexpected = model.load_state_dict(sd, strict=False, assign=patcher.is_dynamic())
+    if missing or unexpected:
+        raise RuntimeError(f"Checkpoint mismatch for {path}: missing={missing}, unexpected={unexpected}")
+    if hasattr(model, "optimize_memory_format"):
+        model.optimize_memory_format()
+    return ComponentHandle(model=model, patcher=patcher, compute_dtype=compute_dtype)
+
+
+def load_lq_projector(path: str, dtype_name: str = "auto") -> ComponentHandle:
+    return _load_managed(
+        path,
+        LQProjector,
+        dtype_name,
+        prefix="LQ_proj_in.",
+        store_compute_dtype=True,
+        force_manual_cast=True,
+    )
+
+
+def load_tcdecoder(
+    path: str,
+    dtype_name: str = "auto",
+    fuse_tgrow: bool = False,
+    channels_last: bool = False,
+) -> ComponentHandle:
+    return _load_managed(
+        path,
+        TCDecoder,
+        dtype_name,
+        store_compute_dtype=True,
+        component_kwargs={
+            "fuse_tgrow": bool(fuse_tgrow),
+            "channels_last": bool(channels_last),
+        },
+    )

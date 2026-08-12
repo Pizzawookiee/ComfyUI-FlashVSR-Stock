@@ -1,0 +1,1122 @@
+{
+  "id": "286a7791-9d6d-4c0a-bb5e-f8cb1e4d1cc5",
+  "revision": 0,
+  "last_node_id": 55,
+  "last_link_id": 84,
+  "nodes": [
+    {
+      "id": 8,
+      "type": "BasicGuider",
+      "pos": [
+        560,
+        -200
+      ],
+      "size": [
+        270,
+        90
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 77
+        },
+        {
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "slot_index": 0,
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0",
+        "Node name for S&R": "BasicGuider"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 7,
+      "type": "FlashVSRPromptLoader",
+      "pos": [
+        130,
+        -120
+      ],
+      "size": [
+        315,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRPromptLoader"
+      },
+      "widgets_values": [
+        "Prompt.safetensors"
+      ]
+    },
+    {
+      "id": 19,
+      "type": "CreateVideo",
+      "pos": [
+        2006.5034722222208,
+        -178.66444444444468
+      ],
+      "size": [
+        270,
+        102
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 28
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 25
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": 26
+        },
+        {
+          "name": "bit_depth",
+          "shape": 7,
+          "type": "INT",
+          "widget": {
+            "name": "bit_depth"
+          },
+          "link": 27
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            29
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0",
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        30,
+        8
+      ]
+    },
+    {
+      "id": 18,
+      "type": "SaveVideo",
+      "pos": [
+        2326.5680555555555,
+        -184.16944444444505
+      ],
+      "size": [
+        270,
+        278
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 29
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0"
+      },
+      "widgets_values": [
+        "video/ComfyUI",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 11,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        940,
+        -220
+      ],
+      "size": [
+        320,
+        190
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "noise",
+          "type": "NOISE",
+          "link": 9
+        },
+        {
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 10
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 41
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 42
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            20
+          ]
+        },
+        {
+          "name": "denoised_output",
+          "type": "LATENT",
+          "slot_index": 1,
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0",
+        "Node name for S&R": "SamplerCustomAdvanced"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 2,
+      "type": "FlashVSRPrepareVideo",
+      "pos": [
+        154.28411868685652,
+        160.54132323232727
+      ],
+      "size": [
+        300,
+        170
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 72
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "FLASHVSR_VIDEO",
+          "slot_index": 0,
+          "links": [
+            5,
+            17,
+            21
+          ]
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "slot_index": 1,
+          "links": [
+            13
+          ]
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "slot_index": 2,
+          "links": null
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "slot_index": 3,
+          "links": null
+        },
+        {
+          "name": "output_frames",
+          "type": "INT",
+          "slot_index": 4,
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRPrepareVideo"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 21,
+      "type": "GetVideoComponents",
+      "pos": [
+        -447.5669477058219,
+        227.02253156565962
+      ],
+      "size": [
+        193.54999389648438,
+        86
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 70
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            71
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            25
+          ]
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": [
+            26
+          ]
+        },
+        {
+          "name": "bit_depth",
+          "type": "INT",
+          "links": [
+            27
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0",
+        "Node name for S&R": "GetVideoComponents"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 49,
+      "type": "ImageScaleBy",
+      "pos": [
+        -178.6390500915714,
+        208.33784731888045
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 71
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            72
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0",
+        "Node name for S&R": "ImageScaleBy"
+      },
+      "widgets_values": [
+        "bicubic",
+        2
+      ]
+    },
+    {
+      "id": 51,
+      "type": "FlashVSRBlockSparseAttention",
+      "pos": [
+        249.4561076988182,
+        -580.1347169459884
+      ],
+      "size": [
+        216.73332824707032,
+        26
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 76
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            77
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRBlockSparseAttention"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 6,
+      "type": "FlashVSRApply",
+      "pos": [
+        -101.24999999999264,
+        -577.916666666664
+      ],
+      "size": [
+        335.55555555555566,
+        184.16666666666714
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 84
+        },
+        {
+          "name": "lq_projector",
+          "type": "FLASHVSR_LQ",
+          "link": 4
+        },
+        {
+          "name": "video",
+          "type": "FLASHVSR_VIDEO",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            76
+          ]
+        },
+        {
+          "name": "FLASHVSR_RUNTIME",
+          "type": "FLASHVSR_RUNTIME",
+          "slot_index": 1,
+          "links": [
+            43
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRApply"
+      },
+      "widgets_values": [
+        1
+      ]
+    },
+    {
+      "id": 14,
+      "type": "FlashVSRCropFrames",
+      "pos": [
+        1690,
+        -180
+      ],
+      "size": [
+        285,
+        102
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 69
+        },
+        {
+          "name": "video",
+          "type": "FLASHVSR_VIDEO",
+          "link": 17
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            28
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRCropFrames"
+      },
+      "widgets_values": [
+        "wavelet_quarter_res",
+        1
+      ]
+    },
+    {
+      "id": 16,
+      "type": "FlashVSRTCDecoderLoader",
+      "pos": [
+        949.2388919406465,
+        86.3888888888888
+      ],
+      "size": [
+        278.29999389648435,
+        130
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "FLASHVSR_DECODER",
+          "type": "FLASHVSR_DECODER",
+          "links": [
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRTCDecoderLoader"
+      },
+      "widgets_values": [
+        "TCDecoder-fp16.safetensors",
+        "fp16",
+        true,
+        true
+      ]
+    },
+    {
+      "id": 17,
+      "type": "FlashVSRTCDecode",
+      "pos": [
+        1358.8416666666662,
+        -201.11111111111114
+      ],
+      "size": [
+        243.81666666666652,
+        122
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 20
+        },
+        {
+          "name": "decoder",
+          "type": "FLASHVSR_DECODER",
+          "link": 19
+        },
+        {
+          "name": "video",
+          "type": "FLASHVSR_VIDEO",
+          "link": 21
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            69
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRTCDecode"
+      },
+      "widgets_values": [
+        4,
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "type": "FlashVSRModelLoader",
+      "pos": [
+        -700.8333333333326,
+        -560
+      ],
+      "size": [
+        315,
+        82
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            80
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRModelLoader"
+      },
+      "widgets_values": [
+        "FlashVSR1_1-int8_convrot.safetensors"
+      ]
+    },
+    {
+      "id": 53,
+      "type": "ModelAttentionBackend",
+      "pos": [
+        -382.1506108133963,
+        -594.4208377512293
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 80
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            84
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0",
+        "Node name for S&R": "ModelAttentionBackend"
+      },
+      "widgets_values": [
+        "comfy kitchen attention"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "FlashVSRLQLoader",
+      "pos": [
+        -280,
+        -350
+      ],
+      "size": [
+        315,
+        106
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "FLASHVSR_LQ",
+          "type": "FLASHVSR_LQ",
+          "slot_index": 0,
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRLQLoader"
+      },
+      "widgets_values": [
+        "LQ_proj_in.safetensors",
+        "fp16"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "RandomNoise",
+      "pos": [
+        550,
+        80
+      ],
+      "size": [
+        285,
+        82
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "NOISE",
+          "type": "NOISE",
+          "slot_index": 0,
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0",
+        "Node name for S&R": "RandomNoise"
+      },
+      "widgets_values": [
+        84984,
+        "fixed"
+      ]
+    },
+    {
+      "id": 47,
+      "type": "LoadVideo",
+      "pos": [
+        -786.1118256505038,
+        226.41987246860003
+      ],
+      "size": [
+        282.83333587646484,
+        498.25000381469727
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            70
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.31.0",
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "Mustache_640x360.mp4",
+        "image"
+      ]
+    },
+    {
+      "id": 33,
+      "type": "FlashVSRStreamingSampler",
+      "pos": [
+        519.2617513461757,
+        -460.89786102699276
+      ],
+      "size": [
+        288.1333374023437,
+        198
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "runtime",
+          "type": "FLASHVSR_RUNTIME",
+          "link": 43
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "links": [
+            41
+          ]
+        },
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            42
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FlashVSRStreamingSampler"
+      },
+      "widgets_values": [
+        "streaming",
+        2,
+        11,
+        0,
+        4,
+        false
+      ]
+    }
+  ],
+  "links": [
+    [
+      4,
+      5,
+      0,
+      6,
+      1,
+      "FLASHVSR_LQ"
+    ],
+    [
+      5,
+      2,
+      0,
+      6,
+      2,
+      "FLASHVSR_VIDEO"
+    ],
+    [
+      7,
+      7,
+      0,
+      8,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      9,
+      10,
+      0,
+      11,
+      0,
+      "NOISE"
+    ],
+    [
+      10,
+      8,
+      0,
+      11,
+      1,
+      "GUIDER"
+    ],
+    [
+      13,
+      2,
+      1,
+      11,
+      4,
+      "LATENT"
+    ],
+    [
+      17,
+      2,
+      0,
+      14,
+      1,
+      "FLASHVSR_VIDEO"
+    ],
+    [
+      19,
+      16,
+      0,
+      17,
+      1,
+      "FLASHVSR_DECODER"
+    ],
+    [
+      20,
+      11,
+      0,
+      17,
+      0,
+      "LATENT"
+    ],
+    [
+      21,
+      2,
+      0,
+      17,
+      2,
+      "FLASHVSR_VIDEO"
+    ],
+    [
+      25,
+      21,
+      1,
+      19,
+      1,
+      "AUDIO"
+    ],
+    [
+      26,
+      21,
+      2,
+      19,
+      2,
+      "FLOAT"
+    ],
+    [
+      27,
+      21,
+      3,
+      19,
+      3,
+      "INT"
+    ],
+    [
+      28,
+      14,
+      0,
+      19,
+      0,
+      "IMAGE"
+    ],
+    [
+      29,
+      19,
+      0,
+      18,
+      0,
+      "VIDEO"
+    ],
+    [
+      41,
+      33,
+      0,
+      11,
+      2,
+      "SAMPLER"
+    ],
+    [
+      42,
+      33,
+      1,
+      11,
+      3,
+      "SIGMAS"
+    ],
+    [
+      43,
+      6,
+      1,
+      33,
+      0,
+      "FLASHVSR_RUNTIME"
+    ],
+    [
+      69,
+      17,
+      0,
+      14,
+      0,
+      "IMAGE"
+    ],
+    [
+      70,
+      47,
+      0,
+      21,
+      0,
+      "VIDEO"
+    ],
+    [
+      71,
+      21,
+      0,
+      49,
+      0,
+      "IMAGE"
+    ],
+    [
+      72,
+      49,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      76,
+      6,
+      0,
+      51,
+      0,
+      "MODEL"
+    ],
+    [
+      77,
+      51,
+      0,
+      8,
+      0,
+      "MODEL"
+    ],
+    [
+      80,
+      3,
+      0,
+      53,
+      0,
+      "MODEL"
+    ],
+    [
+      84,
+      53,
+      0,
+      6,
+      0,
+      "MODEL"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "1. Input and preparation",
+      "bounding": [
+        -803.3146174242474,
+        84.86233712121467,
+        1234.074347222218,
+        686.7121805555571
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "2. Model and FlashVSR patching",
+      "bounding": [
+        -720,
+        -620,
+        1220,
+        660
+      ],
+      "color": "#8a6f3d",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "3. Stock ComfyUI sampling",
+      "bounding": [
+        510,
+        -490,
+        790,
+        780
+      ],
+      "color": "#4d7f4d",
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "4. Wan VAE decode",
+      "bounding": [
+        1330,
+        -240,
+        1140,
+        430
+      ],
+      "color": "#76558c",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.6545454545454874,
+      "offset": [
+        829.1915756454758,
+        807.9759351313417
+      ]
+    },
+    "workflow_notes": "Select an input video in VHS_LoadVideo. ModelAttentionBackend must remain before FlashVSRApply. Replace it with Patch Sage Attention KJ in the same position if desired. Connect the cropped IMAGE output to your preferred video-combine node for export.",
+    "frontendVersion": "1.48.7"
+  },
+  "version": 0.4
+}

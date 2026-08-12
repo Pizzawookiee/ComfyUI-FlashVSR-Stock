@@ -1,0 +1,6 @@
+einops>=0.7.0
+safetensors>=0.4.0
+# Supporting dependency used by the separately installed SpargeAttn wheel.
+# Install the matching spas_sage_attn wheel manually; see README.md.
+triton; platform_system != "Windows"
+triton-windows; platform_system == "Windows"

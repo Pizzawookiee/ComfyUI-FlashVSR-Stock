@@ -1,0 +1,30 @@
+This project reimplements inference components described by and released with
+FlashVSR: Towards Real-Time Diffusion-Based Streaming Video Super-Resolution.
+
+Original project: https://github.com/OpenImagingLab/FlashVSR
+ComfyUI reference: https://github.com/Comfy-Org/ComfyUI
+Distributed safetensors: https://huggingface.co/pizzawookiee/FlashVSR-1.1
+
+This project is distributed under GPL-3.0-only. During development, behavior
+and integration approaches were compared with the following GPL-3.0 projects:
+https://github.com/Comfy-Org/ComfyUI
+https://github.com/1038lab/ComfyUI-FlashVSR
+https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast
+https://github.com/kijai/ComfyUI-KJNodes
+
+GPL-3.0-only is used as the conservative project-wide license. It is compatible
+with incorporating or adapting Apache-2.0 material under GPLv3's terms; this
+notice does not relicense any third-party work.
+
+WanVideoWrapper reference: https://github.com/kijai/ComfyUI-WanVideoWrapper
+WanVideoWrapper is distributed under the Apache License 2.0.
+
+The optional block-sparse attention adapter calls SpargeAttn's public
+block_sparse_sage2_attn_cuda API:
+https://github.com/woct0rdho/SpargeAttn
+Copyright (c) 2025 Jintao Zhang, Chendong Xiang, Haofeng Huang.
+SpargeAttn is distributed separately under the Apache License 2.0.
+
+The temporary-attention routing design was informed by ComfyUI-RadialAttn:
+https://github.com/woct0rdho/ComfyUI-RadialAttn
+Copyright (c) 2025, Apache License 2.0.
