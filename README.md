@@ -41,7 +41,7 @@ optional SpargeAttn route for LCSA. ComfyUI stock nodes are used wherever possib
 - A current ComfyUI installation with stock Wan support.
 - Python 3.10 or newer; pytorch with CUDA 13.0 recommended.
 - An NVIDIA CUDA GPU is strongly recommended.
-- Enough system RAM and VRAM for the chosen resolution and model dtype.
+- Enough system RAM and VRAM for the chosen resolution and model dtype; I tested this on an RTX 4050 6GB VRAM 16GB RAM laptop.
 - FlashVSR v1.1 safetensors (not bundled).
 
 ## Installation
