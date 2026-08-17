@@ -13,14 +13,21 @@ from .runtime import ACTIVE_RUNTIME_OPTION, FlashVSRRuntime
 SAMPLING_MODES = [
     "full_video_dense",
     "streaming",
+    "streaming_faithful_full",
+    "streaming_faithful_lowvram",
 ]
+
+FAITHFUL_MODES = {
+    "streaming_faithful_full",
+    "streaming_faithful_lowvram",
+}
 
 
 def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
                  sparse_ratio: float = 2.0,
                  local_range: int = 11,
                  query_block_chunk: int = 1,
-                 new_latent_frames: int = 4,
+                 new_latent_frames: int = 2,
                  profile_cuda_events: bool = False):
     if sampling_mode not in SAMPLING_MODES:
         raise ValueError(f"Unknown FlashVSR sampling mode: {sampling_mode}")
@@ -28,6 +35,12 @@ def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
     if configured_new_latent_frames not in (2, 4):
         raise ValueError(
             "FlashVSR new_latent_frames must be 2 or 4."
+        )
+    faithful = sampling_mode in FAITHFUL_MODES
+    if faithful and configured_new_latent_frames != 2:
+        raise ValueError(
+            f"{sampling_mode} requires new_latent_frames=2. Four-frame "
+            "continuations are available only in legacy streaming mode."
         )
 
     def flashvsr_sample(model, noise, sigmas, extra_args=None, callback=None, disable=None, **kwargs):
@@ -48,17 +61,35 @@ def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
         runtime.reset()
         runtime.begin_profile(profile_cuda_events)
         sampling_marker = runtime.profile_start(noise)
+        guider = getattr(model, "inner_model", None)
+        guider_name = (
+            type(guider).__name__ if guider is not None else "unknown"
+        )
+        cfg = getattr(guider, "cfg", None)
+        conds = getattr(guider, "conds", {}) or {}
+        negative_present = conds.get("negative") is not None
+        cfg1_disabled = bool(
+            model_options.get("disable_cfg1_optimization", False)
+        )
+        single_pass = (
+            not negative_present
+            or (
+                cfg is not None
+                and math.isclose(float(cfg), 1.0)
+                and not cfg1_disabled
+            )
+        )
+        if faithful and not single_pass:
+            runtime.profile_end("sampling_total", sampling_marker)
+            runtime.finish_profile()
+            runtime.cleanup()
+            raise ValueError(
+                f"{sampling_mode} requires a single conditional model "
+                "pass. Use BasicGuider, or CFG=1 with ComfyUI's CFG=1 "
+                "optimization enabled. Separate positive/negative passes "
+                "cannot safely share one temporal KV cache."
+            )
         if profile_cuda_events:
-            guider = getattr(model, "inner_model", None)
-            guider_name = (
-                type(guider).__name__ if guider is not None else "unknown"
-            )
-            cfg = getattr(guider, "cfg", None)
-            conds = getattr(guider, "conds", {}) or {}
-            negative_present = conds.get("negative") is not None
-            cfg1_disabled = bool(
-                model_options.get("disable_cfg1_optimization", False)
-            )
             if not negative_present:
                 state = "single conditional pass (no negative conditioning)"
             elif (
@@ -117,6 +148,7 @@ def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
 
             runtime.begin_sampling(
                 streaming=True,
+                sampling_mode=sampling_mode,
                 sparse_ratio=sparse_ratio,
                 local_range=local_range,
                 query_block_chunk=query_block_chunk,
@@ -129,9 +161,14 @@ def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
                 process_index, output_start, new_count
             ) in enumerate(segments):
                 lq_marker = runtime.profile_start(noise)
-                runtime.prepare_lq_for_process(
-                    process_index, new_count
-                )
+                if faithful:
+                    runtime.prepare_lq_for_faithful_process(
+                        process_index, new_count
+                    )
+                else:
+                    runtime.prepare_lq_for_process(
+                        process_index, new_count
+                    )
                 runtime.profile_end("lq_projector", lq_marker)
                 runtime.begin_model_chunk()
                 transformer_options["rope_options"] = {
@@ -139,6 +176,10 @@ def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
                 }
                 if segment_number == 0:
                     current = noise[:, :, :6]
+                elif faithful:
+                    current = noise[
+                        :, :, output_start:output_start + new_count
+                    ]
                 else:
                     # Re-run the previous two latent frames beside two or four
                     # new frames. Four-new mode keeps the existing six-frame
@@ -151,10 +192,11 @@ def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
                 model_marker = runtime.profile_start(current)
                 denoised = model(current, sigma, **extra_args)
                 runtime.profile_end("model_total", model_marker)
+                runtime.end_model_chunk()
                 assembly_marker = runtime.profile_start(denoised)
                 selected = (
                     denoised
-                    if segment_number == 0
+                    if segment_number == 0 or faithful
                     else denoised[:, :, -new_count:]
                 )
                 if result is None:

@@ -1,5 +1,3 @@
-If you OOM on https://github.com/naxci1/ComfyUI-FlashVSR_Stable or https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast then try this, it works great on RTX 4050 6GB VRAM 16GB RAM.
-
 # ComfyUI FlashVSR — Stock Wan
 
 FlashVSR v1.1 video super-resolution built around ComfyUI's stock Wan model,
@@ -10,7 +8,7 @@ This project is intended for users who want FlashVSR as a composable ComfyUI
 workflow rather than an all-in-one pipeline. The FlashVSR-specific pieces are
 implemented as custom nodes: LQ projection, block-0 conditioning, the one-step
 streaming sampler, the Tiny Conditional Decoder, postprocessing, and an
-optional SpargeAttn route for LCSA. ComfyUI stock nodes are used wherever possible.
+optional SpargeAttn route for LCSA.
 
 > [!IMPORTANT]
 > This is an independent community implementation, not the official FlashVSR
@@ -24,8 +22,8 @@ optional SpargeAttn route for LCSA. ComfyUI stock nodes are used wherever possib
 - Works with `BasicGuider`, `SamplerCustomAdvanced`, and stock Wan VAE decode.
 - Loads FlashVSR safetensors from `ComfyUI/models/flashvsr`.
 - Preserves FlashVSR's official causal temporal layout and LQ conditioning.
-- Provides bounded overlap-context `streaming` sampling and a dense reference
-  mode.
+- Provides bounded overlap-context sampling, two paper-layout streaming modes
+  with sliding DiT KV caches, and a dense reference mode.
 - Routes dense and cross-attention through the model's selected ComfyUI
   attention backend.
 - Optionally executes FlashVSR's LCSA block mask with a separately installed
@@ -39,9 +37,9 @@ optional SpargeAttn route for LCSA. ComfyUI stock nodes are used wherever possib
 ## Requirements
 
 - A current ComfyUI installation with stock Wan support.
-- Python 3.10 or newer; pytorch with CUDA 13.0 recommended.
+- Python 3.10 or newer.
 - An NVIDIA CUDA GPU is strongly recommended.
-- Enough system RAM and VRAM for the chosen resolution and model dtype; I tested this on an RTX 4050 6GB VRAM 16GB RAM laptop.
+- Enough system RAM and VRAM for the chosen resolution and model dtype.
 - FlashVSR v1.1 safetensors (not bundled).
 
 ## Installation
@@ -72,7 +70,7 @@ Restart ComfyUI after installation.
 
 ## Models
 
-You can use the files I hosted
+Download the safetensors from
 [pizzawookiee/FlashVSR-1.1](https://huggingface.co/pizzawookiee/FlashVSR-1.1/tree/main) and place
 the FlashVSR-specific files in:
 
@@ -80,17 +78,18 @@ the FlashVSR-specific files in:
 ComfyUI/
 └── models/
     └── flashvsr/
-        ├── FlashVSR1_1-int8_convrot.safetensors.safetensors
+        ├── FlashVSR1_1.safetensors
         ├── LQ_proj_in.safetensors
         ├── Prompt.safetensors
-        └── TCDecoder-fp16.safetensors
+        └── TCDecoder.safetensors
 ```
 
 The loaders match component names rather than requiring those exact filenames,
-so you can probably reuse your old safetensors FlashVSR files if you make sure that `FlashVSR1_1` is in the filename for example. 
+so compatible dtype-converted files such as `FlashVSR1_1-int8_convrot.safetensors`
+or `TCDecoder-fp16.safetensors` can also appear in the menus.
 
 The Wan 2.1 VAE is not FlashVSR-specific in this implementation. Put it in the
-usual ComfyUI VAE directory, load it with ComfyUI's stock VAE loader and you can use stock ComfyUI VAE decode rather than TCDecoder:
+usual ComfyUI VAE directory and load it with ComfyUI's stock VAE loader:
 
 ```text
 ComfyUI/models/vae/Wan2.1_VAE.safetensors
@@ -123,7 +122,8 @@ bundled in this repository.
 ## Example workflow
 
 Open [`workflows/FlashVSR_Stock_Wan_Workflow.json`](workflows/FlashVSR_Stock_Wan_Workflow.json)
-in ComfyUI. Select your own input video and installed model files after loading
+in ComfyUI. The included workflow contains no personal paths, credentials, or
+other PII. Select your own input video and installed model files after loading
 it.
 
 The intended graph is:
@@ -139,7 +139,7 @@ The intended graph is:
    `SamplerCustomAdvanced`. The provided sampler owns the one-step streaming
    logic; a regular stock sampler cannot replace it.
 7. Decode with either `FlashVSR Tiny Decode` or ComfyUI's stock Wan VAE.
-8. Run `FlashVSR Postprocess` for color correction and to remove right/bottom alignment padding and
+8. Run `FlashVSR Postprocess` to remove right/bottom alignment padding and
    optional temporal padding, then create/save the output video.
 
 The initial latent is created by `Prepare Video for FlashVSR`. It has the
@@ -150,17 +150,28 @@ then fills it through FlashVSR's one-step model calls.
 
 | Setting | Meaning | Practical guidance |
 | --- | --- | --- |
-| `sampling_mode=streaming` | Six latent frames are evaluated first; later calls recompute two overlap frames and append two or four new frames. LCSA is active. | Recommended default. Peak attention memory is bounded by the segment size rather than total clip length. |
 | `sampling_mode=full_video_dense` | Projects and samples the whole video in one dense-attention call. | Reference/control mode. Usually faster for small clips but VRAM grows strongly with clip length and resolution. |
+| `sampling_mode=streaming` | Six latent frames are evaluated first; later calls recompute two overlap frames and append two or four new frames. There is no DiT KV cache. | Proven compatibility mode. Peak attention memory is bounded by segment size. |
+| `sampling_mode=streaming_faithful_full` | Six-frame prefill followed by exactly two new frames per call. Every Wan block retains a sliding six-frame post-RoPE K/V history. | Closest mode to the paper. Cache storage automatically falls back to CPU when the complete cache does not fit conservatively in VRAM. Highest RAM and transfer cost. |
+| `sampling_mode=streaming_faithful_lowvram` | Uses the faithful two-frame continuation layout and retains the nearest two historical frames in every Wan block. | Low-VRAM compromise that preserves immediate temporal context throughout the DiT. Roughly one third of the full six-frame cache, but with less long-range history than paper inference. |
 | `sparse_ratio` | Global LCSA selection budget. Larger values retain more eligible key blocks. | Higher may preserve more context but increases sparse work. It is not a percentage. Keep the default unless testing quality/performance. |
 | `local_range` | Spatial neighborhood, measured in FlashVSR token blocks, from which LCSA may select. | Larger expands accessible spatial context and routing cost. Keep the default for the reference topology. |
 | `query_block_chunk` | Maximum number of 128-token query blocks expanded per dense masked-attention call. `0` auto-selects a conservative value from free VRAM. | Lower reduces transient mask/attention memory but increases launches. Ignored by Sparge. |
-| `new_latent_frames` | New frames appended per continuation call: `2` or `4`. | `4` normally reduces calls and boundary overhead; use `2` when memory is tight. |
-| `profile_cuda_events` | Prints aggregate CUDA timings for LQ projection, model execution, routing, Sparge, and assembly. | Leave off for normal runs; profiling adds bookkeeping and a final synchronization. |
+| `new_latent_frames` | New frames appended per continuation call: `2` or `4`. | `2` is the default and is mandatory for faithful modes. `4` is available only as a legacy-streaming throughput option. |
+| `profile_cuda_events` | Prints aggregate CUDA timings for LQ projection, KV staging and writes, model execution, routing, Sparge, and assembly. | Leave off for normal runs; profiling adds bookkeeping and a final synchronization. |
 
 `streaming` bounds the model's temporal working set, but the prepared input,
 final latent, and decoded/output frames still grow with video duration. Long
 clips can therefore exhaust system RAM or VRAM outside the attention kernel.
+
+The full faithful cache is a three-slot chronological ring containing two
+latent frames per slot. The low-VRAM cache uses one two-frame slot in every
+Wan block. Both reach a fixed maximum after prefill, so peak cache memory does
+not grow with video duration. When stored on CPU, however, the cache is staged
+once per participating block and continuation; total PCIe traffic and runtime
+therefore grow with clip length. On a 6 GB GPU, start with
+`streaming_faithful_lowvram`. The full mode can use several GiB of system RAM
+at HD output resolutions.
 
 ## Decoder and postprocess settings
 
@@ -185,7 +196,7 @@ attention implementation, dtype, tiling, and decoder.
 
 | Implementation | Integration style | Attention path | Model/VRAM behavior | Best fit |
 | --- | --- | --- | --- | --- |
-| **This repository** | Composable nodes around stock ComfyUI Wan, stock guider/sampler shell, stock VAE option, and `ModelAttentionBackend` | FlashVSR LCSA routing in `streaming`; any mask-capable dense backend, or optional Sparge for the selected blocks | Uses ComfyUI model patchers and `comfy.ops` for load/offload; explicit streaming and Tiny Decoder controls | Users who want FlashVSR to coexist with stock Wan workflows and backend patches |
+| **This repository** | Composable nodes around stock ComfyUI Wan, stock guider/sampler shell, stock VAE option, and `ModelAttentionBackend` | Logical 128×128 LCSA routing; overlap streaming or two-frame streaming with full/final-ten-block KV caching; optional Sparge | Uses ComfyUI model patchers and `comfy.ops`; automatically chooses GPU or block-staged CPU cache storage | Users who want FlashVSR to coexist with stock Wan workflows and backend patches |
 | [Official FlashVSR](https://github.com/OpenImagingLab/FlashVSR) | Standalone reference pipeline | Official LCSA with the compiled Block-Sparse-Attention extension | Reference environment and checkpoint layout; not a native ComfyUI graph | Accuracy/reference validation and supported research setup |
 | [1038lab ComfyUI-FlashVSR](https://github.com/1038lab/ComfyUI-FlashVSR) | Turnkey/all-in-one ComfyUI nodes | Optional SageAttention with fallback | Automatic model download, presets, tiling, and audio passthrough | Easiest self-contained setup |
 | [ComfyUI-FlashVSR Ultra Fast](https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast) | Custom FlashVSR pipeline | Sparse Sage; modified attention behavior | Long-video mode, tiled DiT/VAE, unload controls, full/tiny modes | Users prioritizing its integrated low-VRAM/tiled workflow |
@@ -194,7 +205,8 @@ attention implementation, dtype, tiling, and decoder.
 The official project specifically warns that replacing LCSA with plain dense
 attention can reduce quality at high resolution. This implementation's
 `full_video_dense` mode is therefore a diagnostic/control path, not the
-recommended quality-equivalent replacement for `streaming` LCSA.
+recommended quality-equivalent replacement for LCSA streaming. Use
+`streaming_faithful_full` when comparing most closely with the paper method.
 
 ## Troubleshooting
 
@@ -202,21 +214,22 @@ recommended quality-equivalent replacement for `streaming` LCSA.
 
 Confirm that the files are `.safetensors`, restart ComfyUI, and place all
 FlashVSR-specific weights under lowercase `ComfyUI/models/flashvsr`. Load the
-Wan VAE through the stock VAE loader; that VAE should reside in the usual `ComfyUI/models/vae`.
+Wan VAE through the stock VAE loader from `ComfyUI/models/vae`.
 
 ### Out of memory
 
-Use `streaming`, set `new_latent_frames=2`, use a memory-efficient attention
-backend, keep Tiny Decode at `temporal_batch_size=1`, and test a shorter or
-lower-resolution clip. An INT8/ConvRot DiT can reduce model weight residency,
-but activations, LQ projection, attention, latent storage, and decode output
-still require memory.
+Use `streaming` or `streaming_faithful_lowvram`, keep
+`new_latent_frames=2`, use a memory-efficient attention backend, keep Tiny
+Decode at `temporal_batch_size=1`, and test a shorter or lower-resolution
+clip. Faithful CPU cache offload reduces VRAM, not system-RAM use. An
+INT8/ConvRot DiT reduces model-weight residency, but not FP16/BF16 activation
+or K/V-cache storage.
 
 ### Attention backend rejects the mask
 
 Streaming dense fallback requires a backend that accepts an arbitrary
 per-head attention mask. Switch `ModelAttentionBackend` to a compatible mode,
-or use the optional FlashVSR Sparge node included in this repo.
+or install and use the optional FlashVSR Sparge patch.
 
 ### First run is slower
 
@@ -224,7 +237,33 @@ CUDA kernels and optional Triton/Sparge components may initialize or compile
 on their first compatible call. Compare repeated runs only after the workflow
 has completed successfully at least once.
 
-## Release notes — 0.20.0
+## Release notes — 0.20.2
+
+- Changed `streaming_faithful_lowvram` from a six-frame cache in only the
+  final ten Wan blocks to a two-frame cache in every Wan block.
+- Low-VRAM continuations now preserve immediate temporal context throughout
+  the DiT, eliminating the systematic boundary blur caused by uncached early
+  blocks while retaining approximately the previous cache footprint on a
+  30-block Wan model.
+- The low-VRAM prefill stores the final two frames of the six-frame prefill,
+  ensuring that the first continuation receives the nearest available
+  history.
+
+## Release notes — 0.20.1
+
+- Corrected LCSA routing to score logical 128-query by 128-key
+  `2×8×8` windows. Sparge conversion to physical kernel geometry now happens
+  only after logical routing.
+- Changed the continuation default from four new latent frames to two.
+- Added `streaming_faithful_full`, with a six-frame sliding post-RoPE K/V
+  cache in every Wan block.
+- Added `streaming_faithful_lowvram`, which caches the final ten Wan blocks.
+- Added conservative automatic GPU/CPU cache placement, reusable one-block
+  staging buffers, cache lifecycle validation, and KV transfer profiling.
+- Faithful cache modes require a single conditional pass through BasicGuider
+  or ComfyUI's active CFG=1 optimization.
+
+## Previous release — 0.20.0
 
 - Public-release packaging and Comfy Registry metadata.
 - Added the example stock-Wan workflow after a PII/secret audit.
@@ -235,10 +274,22 @@ has completed successfully at least once.
   baseline: `topk(sorted=False)` LCSA selection and the expanded CUDA profiler
   remain available.
 
+## Publishing checklist
+
+Before the first Comfy Registry publish:
+
+1. Confirm the `Pizzawookiee` publisher exists in the Comfy Registry and that
+   the publishing token has permission to publish `comfyui-flashvsr-stock`.
+2. Optionally add a repository-relative icon and update `Icon`; do not use the
+   placeholder example URL from the Registry template.
+3. Add the repository secret `REGISTRY_ACCESS_TOKEN` in GitHub Actions.
+4. Commit a `pyproject.toml` change on `main`, or manually dispatch
+   `.github/workflows/publish_action.yml`.
+
 ## Credits and license
 
-This project borrows from components described by
-[FlashVSR](https://github.com/OpenImagingLab/FlashVSR) and
+This project reimplements components described by
+[FlashVSR](https://github.com/OpenImagingLab/FlashVSR) and uses stock
 [ComfyUI](https://github.com/Comfy-Org/ComfyUI) APIs. Safetensors naming and
 packaging follow the files published at
 [pizzawookiee/FlashVSR-1.1](https://huggingface.co/pizzawookiee/FlashVSR-1.1/tree/main).
@@ -246,4 +297,8 @@ The optional sparse executor calls the separately distributed
 [SpargeAttn](https://github.com/woct0rdho/SpargeAttn) library. See
 [`NOTICE`](NOTICE) for attribution details.
 
-
+The repository code is licensed under `GPL-3.0-only`. This conservative choice
+covers the GPLv3 implementation references used during development while still
+allowing Apache-2.0 source material to be incorporated under GPLv3's terms.
+Model weights and separately installed dependencies retain their own licenses
+and terms.

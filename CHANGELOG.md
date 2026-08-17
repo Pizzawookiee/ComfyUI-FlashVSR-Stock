@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.20.2
+
+- Reworked `streaming_faithful_lowvram` to cache the nearest two historical
+  latent frames in every Wan block instead of six frames in only the final
+  ten blocks.
+- Preserved approximately the same cache footprint and aggregate attention
+  workload for a 30-block Wan model while restoring temporal context to early
+  transformer layers.
+- Corrected low-VRAM prefill selection to retain the final two frames of the
+  initial six-frame segment.
+- Updated cache diagnostics and sampler documentation for the new behavior.
+
+## 0.20.1
+
+- Corrected LCSA routing geometry to logical 128-query by 128-key
+  `2x8x8` blocks, with backend-specific Sparge conversion applied afterward.
+- Changed the default continuation size from four new latent frames to two.
+- Added `streaming_faithful_full`: six-frame prefill, two-frame
+  continuations, and a six-frame sliding post-RoPE K/V cache in every Wan
+  block.
+- Added `streaming_faithful_lowvram`, which applies the same temporal layout
+  and caches the final ten Wan blocks.
+- Added conservative automatic GPU/CPU cache placement, reusable block-local
+  GPU staging, cache-ring lifecycle checks, strict single-pass guider
+  validation, and K/V transfer profiling.
+- Preserved `full_video_dense` and overlap-context `streaming` for comparison
+  and backward compatibility.
+
 ## 0.20.0
 
 - Prepared the project for public GitHub and Comfy Registry distribution.

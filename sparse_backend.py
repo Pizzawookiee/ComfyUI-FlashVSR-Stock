@@ -1,4 +1,4 @@
-"""Optional SpargeAttn executor for FlashVSR's native LCSA mask."""
+"""Optional SpargeAttn executor for FlashVSR's logical LCSA mask."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ class FlashVSRSpargeBackend:
 
     @staticmethod
     def _convert_mask_for_arch(mask: torch.Tensor, capability):
-        """Convert native 128x64 LCSA blocks for Sparge's GPU geometry."""
+        """Convert logical 128x128 LCSA blocks for Sparge GPU geometry."""
         major, minor = capability
         if major < 8:
             raise RuntimeError(
@@ -42,14 +42,13 @@ class FlashVSRSpargeBackend:
                 "or newer NVIDIA GPU (compute capability 8.0 or newer)."
             )
 
-        # Sparge's Hopper kernel consumes 64-query x 128-key blocks. Split
-        # each LCSA query block and conservatively merge each adjacent key
-        # pair so no connection selected by FlashVSR is discarded.
+        # Hopper consumes 64Q x 128K: split each logical query block. Other
+        # supported architectures consume 128Q x 64K: split each logical key
+        # block. Both physical halves inherit the one logical LCSA decision.
         if (major, minor) == (9, 0):
-            if mask.shape[-1] % 2:
-                mask = torch.nn.functional.pad(mask, (0, 1), value=False)
             mask = mask.repeat_interleave(2, dim=-2)
-            mask = mask.reshape(*mask.shape[:-1], -1, 2).any(dim=-1)
+        else:
+            mask = mask.repeat_interleave(2, dim=-1)
         return mask
 
     def run_flashvsr(
@@ -59,7 +58,8 @@ class FlashVSRSpargeBackend:
         v,
         heads,
         mask,
-        block_to_original,
+        q_block_to_original,
+        k_block_to_original,
         profiler=None,
     ):
         """Run one complete sparse layer and restore stock Wan token order."""
@@ -73,10 +73,14 @@ class FlashVSRSpargeBackend:
                 "FlashVSR Sparge Attention received a channel count that is "
                 "not divisible by the attention head count."
             )
-        if k.shape != q.shape or v.shape != q.shape:
+        if (
+            k.shape != v.shape
+            or k.shape[0] != q.shape[0]
+            or k.shape[2] != channels
+        ):
             raise RuntimeError(
-                "FlashVSR Sparge Attention requires equal self-attention "
-                "Q/K/V shapes."
+                "FlashVSR Sparge Attention received incompatible Q/K/V "
+                "batch or channel shapes."
             )
         head_dim = channels // heads
         if head_dim not in (64, 128):
@@ -84,17 +88,18 @@ class FlashVSRSpargeBackend:
                 "FlashVSR Sparge Attention supports 64- or 128-wide "
                 f"attention heads, but received {head_dim}."
             )
-        if q_tokens % 128 or k.shape[1] % 64:
+        k_tokens = k.shape[1]
+        if q_tokens % 128 or k_tokens % 128:
             raise RuntimeError(
-                "FlashVSR Sparge Attention requires 128-query by 64-key "
-                "aligned token counts."
+                "FlashVSR logical LCSA requires Q and K token counts aligned "
+                "to 128-token blocks."
             )
 
         expected_mask = (
             batch,
             heads,
             q_tokens // 128,
-            k.shape[1] // 64,
+            k_tokens // 128,
         )
         if tuple(mask.shape) != expected_mask:
             raise RuntimeError(
@@ -111,19 +116,19 @@ class FlashVSRSpargeBackend:
         q_hnd = (
             q.view(batch, q_tokens, heads, head_dim)
             .permute(0, 2, 1, 3)
-            .index_select(2, block_to_original)
+            .index_select(2, q_block_to_original)
             .contiguous()
         )
         k_hnd = (
-            k.view(batch, q_tokens, heads, head_dim)
+            k.view(batch, k_tokens, heads, head_dim)
             .permute(0, 2, 1, 3)
-            .index_select(2, block_to_original)
+            .index_select(2, k_block_to_original)
             .contiguous()
         )
         v_hnd = (
-            v.view(batch, q_tokens, heads, head_dim)
+            v.view(batch, k_tokens, heads, head_dim)
             .permute(0, 2, 1, 3)
-            .index_select(2, block_to_original)
+            .index_select(2, k_block_to_original)
             .contiguous()
         )
         if profiler is not None:
@@ -167,7 +172,7 @@ class FlashVSRSpargeBackend:
             output_nhd = output_nhd.to(dtype=q.dtype)
         attended.view(batch, q_tokens, heads, head_dim).index_copy_(
             1,
-            block_to_original,
+            q_block_to_original,
             output_nhd,
         )
         if profiler is not None:

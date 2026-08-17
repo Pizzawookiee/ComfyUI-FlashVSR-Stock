@@ -181,6 +181,280 @@ class StreamingAttentionDispatcher:
         )
 
 
+class FlashVSRKVCache:
+    """Per-Wan-block sliding post-RoPE KV cache.
+
+    Full faithful mode retains three chronological two-frame slots (six
+    historical frames). Low-VRAM mode retains the nearest two-frame slot in
+    every Wan block. The write cursor always identifies the oldest slot.
+    Cached tensors have already received Wan RoPE and must never be rotated
+    again.
+    """
+
+    PREFILL_FRAMES = 6
+    FULL_HISTORY_FRAMES = 6
+    LOWVRAM_HISTORY_FRAMES = 2
+    SLOT_FRAMES = 2
+
+    def __init__(self, runtime: "FlashVSRRuntime"):
+        self.runtime = runtime
+        self.mode = None
+        self.total_blocks = 0
+        self.active_blocks = set()
+        self.history_frames = 0
+        self.slot_count = 0
+        self.entries = {}
+        self.storage_device = None
+        self.write_slot = 0
+        self.initial_chunk = False
+        self.committed_blocks = set()
+        self.stage_k = None
+        self.stage_v = None
+        self.total_cache_bytes = 0
+        self.reported = False
+
+    @property
+    def enabled(self):
+        return bool(self.active_blocks)
+
+    def configure(self, mode, total_blocks):
+        self.clear()
+        self.mode = mode
+        self.total_blocks = max(0, int(total_blocks or 0))
+        if mode == "streaming_faithful_full":
+            self.active_blocks = set(range(self.total_blocks))
+            self.history_frames = self.FULL_HISTORY_FRAMES
+        elif mode == "streaming_faithful_lowvram":
+            # Immediate history in every layer is substantially more useful
+            # than a longer history introduced only after early blocks have
+            # already processed the continuation without temporal context.
+            # For a 30-block Wan model this has the same block-frame cache
+            # footprint as retaining six frames in only the final ten blocks.
+            self.active_blocks = set(range(self.total_blocks))
+            self.history_frames = self.LOWVRAM_HISTORY_FRAMES
+        else:
+            self.active_blocks = set()
+            self.history_frames = 0
+        self.slot_count = self.history_frames // self.SLOT_FRAMES
+        if mode and not self.active_blocks:
+            raise RuntimeError(
+                "FlashVSR could not determine the Wan transformer block "
+                "count required for faithful KV caching."
+            )
+
+    def participates(self, block_index):
+        return int(block_index) in self.active_blocks
+
+    def begin_chunk(self, initial):
+        self.initial_chunk = bool(initial)
+        self.committed_blocks.clear()
+
+    def end_chunk(self):
+        if not self.enabled:
+            return
+        missing = self.active_blocks.difference(self.committed_blocks)
+        if missing:
+            preview = ", ".join(str(index) for index in sorted(missing)[:8])
+            raise RuntimeError(
+                "FlashVSR did not update every configured KV-cache block "
+                f"during this model call. Missing block indices: {preview}."
+            )
+        if not self.initial_chunk:
+            self.write_slot = (self.write_slot + 1) % self.slot_count
+
+    @staticmethod
+    def _allocate_copy(source, device):
+        destination = torch.empty(
+            source.shape,
+            device=device,
+            dtype=source.dtype,
+        )
+        destination.copy_(source.detach(), non_blocking=False)
+        return destination
+
+    def _choose_storage_device(self, k, slot_tokens):
+        bytes_per_block = (
+            2
+            * k.shape[0]
+            * (self.slot_count * slot_tokens)
+            * k.shape[2]
+            * k.element_size()
+        )
+        # slot_tokens is the token count for two frames. The arithmetic above
+        # is K+V times the mode-specific number of two-frame history slots.
+        self.total_cache_bytes = bytes_per_block * len(self.active_blocks)
+        placement = torch.device("cpu")
+        free_bytes = None
+        if k.device.type == "cuda":
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(k.device)
+                reserve = max(
+                    1024 * 1024 * 1024,
+                    int(total_bytes * 0.20),
+                )
+                conservative_budget = min(
+                    max(0, free_bytes - reserve),
+                    int(free_bytes * 0.35),
+                )
+                if self.total_cache_bytes <= conservative_budget:
+                    placement = k.device
+            except (RuntimeError, TypeError):
+                placement = torch.device("cpu")
+        self.storage_device = placement
+        if not self.reported:
+            first = min(self.active_blocks)
+            last = max(self.active_blocks)
+            free_text = (
+                f", free VRAM={free_bytes / (1024 ** 2):.0f} MiB"
+                if free_bytes is not None else ""
+            )
+            print(
+                "[FlashVSR] faithful KV cache: blocks "
+                f"{first}-{last}, history={self.history_frames} frames, "
+                f"storage={placement}, "
+                f"estimated={self.total_cache_bytes / (1024 ** 3):.2f} GiB"
+                f"{free_text}."
+            )
+            if placement.type == "cpu":
+                print(
+                    "[FlashVSR] faithful KV cache transfer per "
+                    "continuation: approximately "
+                    f"{self.total_cache_bytes / (1024 ** 3):.2f} GiB "
+                    "CPU->GPU and "
+                    f"{self.total_cache_bytes / self.slot_count / (1024 ** 3):.2f} GiB "
+                    "GPU->CPU."
+                )
+            self.reported = True
+
+    def _initial_store(self, block_index, k, v, tokens_per_frame):
+        slot_tokens = self.SLOT_FRAMES * tokens_per_frame
+        if self.storage_device is None:
+            self._choose_storage_device(k, slot_tokens)
+        try:
+            slots = self._copy_initial_slots(k, v, slot_tokens)
+        except RuntimeError:
+            if self.storage_device.type != "cuda":
+                raise
+            # The conservative estimate can still be defeated by a later
+            # module workspace or allocator fragmentation. Preserve already
+            # collected history by migrating it once, then retry on CPU.
+            self._migrate_entries_to_cpu()
+            slots = self._copy_initial_slots(k, v, slot_tokens)
+        self.entries[int(block_index)] = slots
+
+    def _copy_initial_slots(self, k, v, slot_tokens):
+        slots = []
+        # Full mode retains all six prefill frames. Low-VRAM mode must retain
+        # the nearest two prefill frames, so start at the tail of the input.
+        history_tokens = self.history_frames * (slot_tokens // self.SLOT_FRAMES)
+        history_start = k.shape[1] - history_tokens
+        for slot_index in range(self.slot_count):
+            start = history_start + slot_index * slot_tokens
+            end = start + slot_tokens
+            slots.append((
+                self._allocate_copy(k[:, start:end], self.storage_device),
+                self._allocate_copy(v[:, start:end], self.storage_device),
+            ))
+        return slots
+
+    def _migrate_entries_to_cpu(self):
+        migrated = {}
+        for block_index, slots in self.entries.items():
+            migrated[block_index] = [
+                (
+                    self._allocate_copy(cached_k, torch.device("cpu")),
+                    self._allocate_copy(cached_v, torch.device("cpu")),
+                )
+                for cached_k, cached_v in slots
+            ]
+        self.entries = migrated
+        self.storage_device = torch.device("cpu")
+        self.stage_k = None
+        self.stage_v = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(
+            "[FlashVSR] faithful KV cache fell back to CPU after GPU "
+            "allocation pressure."
+        )
+
+    def stage(self, block_index, k, v, tokens_per_frame):
+        """Return chronological cached+current K/V for a continuation."""
+        if self.initial_chunk:
+            return k, v
+        slots = self.entries.get(int(block_index))
+        if slots is None:
+            raise RuntimeError(
+                f"FlashVSR KV cache for Wan block {block_index} was not "
+                "initialized by the first six-frame model call."
+            )
+        current_tokens = self.SLOT_FRAMES * tokens_per_frame
+        history_tokens = self.history_frames * tokens_per_frame
+        total_tokens = history_tokens + current_tokens
+        required_shape = (k.shape[0], total_tokens, k.shape[2])
+        if (
+            self.stage_k is None
+            or tuple(self.stage_k.shape) != required_shape
+            or self.stage_k.device != k.device
+            or self.stage_k.dtype != k.dtype
+        ):
+            self.stage_k = torch.empty(
+                required_shape, device=k.device, dtype=k.dtype
+            )
+            self.stage_v = torch.empty_like(self.stage_k)
+
+        offset = 0
+        for relative in range(self.slot_count):
+            slot_index = (self.write_slot + relative) % self.slot_count
+            cached_k, cached_v = slots[slot_index]
+            end = offset + current_tokens
+            self.stage_k[:, offset:end].copy_(cached_k, non_blocking=False)
+            self.stage_v[:, offset:end].copy_(cached_v, non_blocking=False)
+            offset = end
+        self.stage_k[:, history_tokens:].copy_(k, non_blocking=False)
+        self.stage_v[:, history_tokens:].copy_(v, non_blocking=False)
+        return self.stage_k, self.stage_v
+
+    def commit(self, block_index, k, v, tokens_per_frame):
+        block_index = int(block_index)
+        if self.initial_chunk:
+            expected = self.PREFILL_FRAMES * tokens_per_frame
+            if k.shape[1] != expected or v.shape[1] != expected:
+                raise RuntimeError(
+                    "FlashVSR initial KV cache requires exactly six latent "
+                    "frames."
+                )
+            self._initial_store(block_index, k, v, tokens_per_frame)
+        else:
+            expected = self.SLOT_FRAMES * tokens_per_frame
+            if k.shape[1] != expected or v.shape[1] != expected:
+                raise RuntimeError(
+                    "FlashVSR continuation KV cache requires exactly two "
+                    "new latent frames."
+                )
+            slots = self.entries[block_index]
+            cached_k, cached_v = slots[self.write_slot]
+            cached_k.copy_(k.detach(), non_blocking=False)
+            cached_v.copy_(v.detach(), non_blocking=False)
+        self.committed_blocks.add(block_index)
+
+    def clear(self):
+        self.mode = None
+        self.total_blocks = 0
+        self.entries = {}
+        self.active_blocks = set()
+        self.history_frames = 0
+        self.slot_count = 0
+        self.storage_device = None
+        self.write_slot = 0
+        self.initial_chunk = False
+        self.committed_blocks = set()
+        self.stage_k = None
+        self.stage_v = None
+        self.total_cache_bytes = 0
+        self.reported = False
+
+
 class FlashVSRRuntime:
     """FlashVSR LQ conditioning and optional temporal streaming state."""
 
@@ -196,10 +470,12 @@ class FlashVSRRuntime:
         self.current_latent_frames = 0
         self.current_rope_start = 0
         self.streaming_active = False
+        self.sampling_mode = None
+        self.total_wan_blocks = 0
         self.lcsa_sparse_ratio = 2.0
         self.lcsa_local_range = 11
         self.lcsa_query_block_chunk = 1
-        self.resolved_lcsa_query_block_chunk = None
+        self.resolved_lcsa_query_block_chunk = {}
         self.local_spatial_mask_cache = {}
         self.local_topology_cache = {}
         self.lcsa_token_index_cache = {}
@@ -212,6 +488,7 @@ class FlashVSRRuntime:
         self.profile_enabled = False
         self.profile_events = {}
         self.profile_devices = set()
+        self.kv_cache = FlashVSRKVCache(self)
 
     def begin_profile(self, enabled: bool):
         """Start a non-synchronizing CUDA-event profiling collection."""
@@ -276,6 +553,9 @@ class FlashVSRRuntime:
             "lq_cache_update",
             "lq_linear",
             "model_total",
+            "kv_cache_stage_h2d",
+            "kv_cache_write_d2h",
+            "kv_cached_attention",
             "lcsa_routing",
             "sparge_layout_qkv",
             "sparge_mask_convert",
@@ -295,6 +575,8 @@ class FlashVSRRuntime:
 
         nested = sum(
             totals.get(name, 0.0) for name in (
+                "kv_cache_stage_h2d",
+                "kv_cache_write_d2h",
                 "lcsa_routing",
                 "sparge_layout_qkv",
                 "sparge_mask_convert",
@@ -416,21 +698,45 @@ class FlashVSRRuntime:
             **call_kwargs,
         )
 
-    def begin_sampling(self, streaming: bool, sparse_ratio: float = 2.0,
+    def set_total_wan_blocks(self, count):
+        self.total_wan_blocks = max(0, int(count))
+
+    def begin_sampling(self, streaming: bool, sampling_mode=None,
+                       sparse_ratio: float = 2.0,
                        local_range: int = 11,
                        query_block_chunk: int = 1):
         self.streaming_active = streaming
+        self.sampling_mode = sampling_mode
         self.lcsa_sparse_ratio = max(0.1, float(sparse_ratio))
         self.lcsa_local_range = max(1, int(local_range))
         # Zero selects a conservative value from the free CUDA memory seen by
         # the first self-attention block of each model segment.
         self.lcsa_query_block_chunk = max(0, int(query_block_chunk))
-        self.resolved_lcsa_query_block_chunk = None
+        self.resolved_lcsa_query_block_chunk = {}
         self.seen_self_attention_blocks.clear()
+        faithful_mode = (
+            sampling_mode
+            if sampling_mode in (
+                "streaming_faithful_full",
+                "streaming_faithful_lowvram",
+            )
+            else None
+        )
+        self.kv_cache.configure(faithful_mode, self.total_wan_blocks)
 
     def begin_model_chunk(self):
         self.seen_self_attention_blocks.clear()
-        self.resolved_lcsa_query_block_chunk = None
+        self.resolved_lcsa_query_block_chunk = {}
+        self.kv_cache.begin_chunk(
+            initial=(
+                self.kv_cache.enabled
+                and self.current_rope_start == 0
+                and self.current_latent_frames == 6
+            )
+        )
+
+    def end_model_chunk(self):
+        self.kv_cache.end_chunk()
 
     def streaming_attention(self, q, k, v, heads, mask=None,
                             attn_precision=None, skip_reshape=False,
@@ -469,12 +775,31 @@ class FlashVSRRuntime:
             )
 
         self.seen_self_attention_blocks.add(block_index)
-        return self._streaming_lcsa_attention(
+        tokens_per_frame = spatial_tokens
+        cache_active = self.kv_cache.participates(block_index)
+        current_k = k
+        current_v = v
+        if cache_active:
+            cache_marker = self.profile_start(k)
+            k, v = self.kv_cache.stage(
+                block_index, k, v, tokens_per_frame
+            )
+            self.profile_end("kv_cache_stage_h2d", cache_marker)
+        attention_marker = self.profile_start(q) if cache_active else None
+        attended = self._streaming_lcsa_attention(
             block_index, q, k, v, heads,
             attn_precision=attn_precision,
             transformer_options=options,
             **kwargs,
         )
+        self.profile_end("kv_cached_attention", attention_marker)
+        if cache_active:
+            cache_marker = self.profile_start(current_k)
+            self.kv_cache.commit(
+                block_index, current_k, current_v, tokens_per_frame
+            )
+            self.profile_end("kv_cache_write_d2h", cache_marker)
+        return attended
 
     def _local_spatial_mask(self, grid_h, grid_w, local_range, device):
         device = torch.device(device)
@@ -500,12 +825,12 @@ class FlashVSRRuntime:
         self.local_spatial_mask_cache[cache_key] = mask
         return mask
 
-    def _local_block_topology(self, q_temporal, grid_h, grid_w,
+    def _local_block_topology(self, q_temporal, k_temporal, grid_h, grid_w,
                               local_range, device):
         """Return a cached, broadcastable LCSA local-neighborhood mask."""
         device = torch.device(device)
         cache_key = (
-            q_temporal, grid_h, grid_w, local_range,
+            q_temporal, k_temporal, grid_h, grid_w, local_range,
             device.type, device.index,
         )
         cached = self.local_topology_cache.get(cache_key)
@@ -519,14 +844,14 @@ class FlashVSRRuntime:
         # This reshape of an expanded tensor may materialize. Cache the small
         # static result once instead of rebuilding it in every Wan block.
         topology = (
-            local.view(1, 1, 1, spatial, 1, spatial, 1)
+            local.view(1, 1, 1, spatial, 1, spatial)
             .expand(
                 1, 1, q_temporal, spatial,
-                q_temporal, spatial, 2,
+                k_temporal, spatial,
             )
             .reshape(
                 1, 1, q_temporal, spatial,
-                q_temporal * spatial * 2,
+                k_temporal * spatial,
             )
             .contiguous()
         )
@@ -547,9 +872,7 @@ class FlashVSRRuntime:
                     - max(0, col - half),
                 )
                 spatial_pairs += row_count * col_count
-        eligible_per_temporal_query = (
-            spatial_pairs * q_temporal * 2
-        )
+        eligible_per_temporal_query = spatial_pairs * k_temporal
         cached = (topology, eligible_per_temporal_query)
         self.local_topology_cache[cache_key] = cached
         return cached
@@ -560,8 +883,11 @@ class FlashVSRRuntime:
         requested = self.lcsa_query_block_chunk
         if requested > 0:
             return min(requested, q_blocks)
-        if self.resolved_lcsa_query_block_chunk is not None:
-            return min(self.resolved_lcsa_query_block_chunk, q_blocks)
+        cached_resolution = self.resolved_lcsa_query_block_chunk.get(
+            int(key_tokens)
+        )
+        if cached_resolution is not None:
+            return min(cached_resolution, q_blocks)
 
         resolved = 1
         free_bytes = None
@@ -586,8 +912,8 @@ class FlashVSRRuntime:
             except (RuntimeError, TypeError):
                 resolved = 1
 
-        self.resolved_lcsa_query_block_chunk = resolved
-        report_key = (self.current_latent_frames, resolved)
+        self.resolved_lcsa_query_block_chunk[int(key_tokens)] = resolved
+        report_key = (self.current_latent_frames, key_tokens, resolved)
         if report_key not in self.reported_auto_chunks:
             memory = (
                 f", free VRAM {free_bytes / (1024 ** 2):.0f} MiB"
@@ -623,27 +949,31 @@ class FlashVSRRuntime:
         )
         original_to_key_block = torch.empty_like(block_to_original)
         original_to_key_block[block_to_original] = (
-            torch.arange(token_count, device=device) // 64
+            torch.arange(token_count, device=device) // 128
         )
         cached = (block_to_original, original_to_key_block)
         self.lcsa_token_index_cache[cache_key] = cached
         return cached
 
-    def _lcsa_block_mask(self, q, k, heads, frames, height, width,
+    def _lcsa_block_mask(self, q, k, heads, q_frames, k_frames,
+                         height, width,
                          grid_h, grid_w):
-        """Build FlashVSR's 128-query x 64-key block topology."""
+        """Build FlashVSR's logical 128-query x 128-key topology."""
         batch, q_tokens, channels = q.shape
         k_batch, k_tokens, k_channels = k.shape
-        q_temporal = frames // 2
-        k_temporal = q_temporal
+        q_temporal = q_frames // 2
+        k_temporal = k_frames // 2
         spatial = grid_h * grid_w
-        expected_tokens = frames * height * width
+        expected_q_tokens = q_frames * height * width
+        expected_k_tokens = k_frames * height * width
         if (
             k_batch != batch
-            or q_tokens != expected_tokens
-            or k_tokens != expected_tokens
+            or q_tokens != expected_q_tokens
+            or k_tokens != expected_k_tokens
             or k_channels != channels
             or channels % heads
+            or q_frames % 2
+            or k_frames % 2
         ):
             raise RuntimeError("Invalid FlashVSR LCSA Q/K window shapes.")
         head_dim = channels // heads
@@ -657,27 +987,22 @@ class FlashVSRRuntime:
         ).mean(dim=(2, 4, 6)).reshape(
             batch, q_temporal, spatial, heads, head_dim
         )
-        k_pool = (
-            k.view(
-                batch, k_temporal, 2, grid_h, 8, grid_w, 8,
-                heads, head_dim,
-            )
-            .mean(dim=(4, 6))
-            .permute(0, 1, 3, 4, 2, 5, 6)
-            .reshape(
-                batch, k_temporal, spatial, 2, heads, head_dim
-            )
+        k_pool = k.view(
+            batch, k_temporal, 2, grid_h, 8, grid_w, 8,
+            heads, head_dim,
+        ).mean(dim=(2, 4, 6)).reshape(
+            batch, k_temporal, spatial, heads, head_dim
         )
         scores = torch.einsum(
-            "btnhd,bsmrhd->bhtnsmr", q_pool, k_pool
+            "btnhd,bsmhd->bhtnsm", q_pool, k_pool
         ) / math.sqrt(head_dim)
         scores = scores.reshape(
             batch, heads, q_temporal, spatial,
-            k_temporal * spatial * 2,
+            k_temporal * spatial,
         ).float()
 
         local, eligible_count = self._local_block_topology(
-            q_temporal, grid_h, grid_w,
+            q_temporal, k_temporal, grid_h, grid_w,
             self.lcsa_local_range, scores.device,
         )
         scores.masked_fill_(~local, -torch.inf)
@@ -723,32 +1048,43 @@ class FlashVSRRuntime:
                                   transformer_options=None, **kwargs):
         height = self.video.height // 16
         width = self.video.width // 16
-        frames = self.current_latent_frames
+        q_frames = self.current_latent_frames
+        tokens_per_frame = height * width
+        if k.shape[1] % tokens_per_frame:
+            raise RuntimeError(
+                "FlashVSR cached K length is not divisible by the Wan "
+                "spatial token count."
+            )
+        k_frames = k.shape[1] // tokens_per_frame
         grid_h = height // 8
         grid_w = width // 8
 
         routing_marker = self.profile_start(q)
         block_mask = self._lcsa_block_mask(
-            q, k, heads, frames, height, width, grid_h, grid_w
+            q, k, heads, q_frames, k_frames,
+            height, width, grid_h, grid_w
         )
         self.profile_end("lcsa_routing", routing_marker)
         batch, _, channels = q.shape
-        q_temporal = frames // 2
+        q_temporal = q_frames // 2
         spatial = grid_h * grid_w
         q_blocks = q_temporal * spatial
         block_mask = block_mask.reshape(
             batch, heads, q_blocks, -1
         )
-        block_to_original, original_to_key_block = (
+        q_block_to_original, _ = self._lcsa_token_indices(
+            q_frames, height, width, q.device
+        )
+        k_block_to_original, original_to_key_block = (
             self._lcsa_token_indices(
-                frames, height, width, q.device
+                k_frames, height, width, q.device
             )
         )
 
-        # The optional Sparge backend consumes the native 128-query x 64-key
-        # FlashVSR block mask through a private route. It gathers directly into
-        # its final HND layout, executes one complete sparse layer, and restores
-        # stock Wan order without replacing ModelAttentionBackend.
+        # The optional Sparge backend consumes the logical 128-query x 128-key
+        # FlashVSR block mask through a private route. It converts that mask to
+        # the GPU kernel's physical geometry, gathers directly into final HND
+        # layout, and preserves ModelAttentionBackend for all other attention.
         if getattr(
             self.sparse_attention_backend,
             "flashvsr_block_sparse",
@@ -761,7 +1097,8 @@ class FlashVSRRuntime:
                     v,
                     heads,
                     block_mask,
-                    block_to_original,
+                    q_block_to_original,
+                    k_block_to_original,
                     profiler=self,
                 )
             except Exception as error:
@@ -780,7 +1117,7 @@ class FlashVSRRuntime:
         )
         for start in range(0, q_blocks, chunk):
             end = min(start + chunk, q_blocks)
-            query_indices = block_to_original[
+            query_indices = q_block_to_original[
                 start * 128:end * 128
             ]
             q_chunk = q.index_select(1, query_indices)
@@ -827,8 +1164,10 @@ class FlashVSRRuntime:
         self.current_latent_frames = 0
         self.current_rope_start = 0
         self.streaming_active = False
-        self.resolved_lcsa_query_block_chunk = None
+        self.sampling_mode = None
+        self.resolved_lcsa_query_block_chunk = {}
         self.seen_self_attention_blocks.clear()
+        self.kv_cache.clear()
         self.lq.model.clear_cache()
 
     def cleanup(self):
@@ -1054,6 +1393,31 @@ class FlashVSRRuntime:
             self.current_latent_frames = 2 + int(new_latent_frames)
             self.current_rope_start = 2 + process_index * 2
 
+    def prepare_lq_for_faithful_process(
+        self, process_index: int, new_latent_frames: int = 2
+    ):
+        """Prepare paper-layout LQ tokens without replaying overlap frames."""
+        if int(new_latent_frames) != 2 and process_index != 0:
+            raise ValueError(
+                "Faithful FlashVSR continuations require two new latent "
+                "frames."
+            )
+        current = self._prepare_lq_chunk(
+            process_index, new_latent_frames
+        )
+        self.current_lq = current
+        self.lq_overlap_tail = None
+        self.lq_overlap_compact = False
+        self.lq_segment_buffers = None
+        if process_index == 0:
+            self.current_latent_frames = 6
+            self.current_rope_start = 0
+        else:
+            self.current_latent_frames = int(new_latent_frames)
+            # The first six-frame prefill occupies positions 0..5. Each
+            # subsequent process contributes exactly two new positions.
+            self.current_rope_start = 4 + process_index * 2
+
     def prepare_lq_full(self, latent_frames: int):
         process_total = latent_frames // 2 - 2
         if process_total < 1 or latent_frames % 2:
@@ -1108,6 +1472,16 @@ class _FlashVSRBlock0Patch:
 
 def patch_model(model, runtime: FlashVSRRuntime):
     patched = model.clone()
+    try:
+        blocks = patched.get_model_object("diffusion_model.blocks")
+        runtime.set_total_wan_blocks(len(blocks))
+    except (AttributeError, KeyError, TypeError, RuntimeError):
+        try:
+            runtime.set_total_wan_blocks(
+                len(patched.model.diffusion_model.blocks)
+            )
+        except (AttributeError, TypeError, RuntimeError):
+            runtime.set_total_wan_blocks(0)
     patched.set_model_patch_replace(
         _FlashVSRBlock0Patch(runtime), "dit", "double_block", 0
     )

@@ -209,7 +209,9 @@ class FlashVSRApply:
 class FlashVSRBlockSparseAttention:
     DESCRIPTION = (
         "Uses the separately installed SpargeAttn library to execute "
-        "FlashVSR's native 128-query by 64-key LCSA mask during streaming. "
+        "FlashVSR's logical 128-query by 128-key LCSA mask during streaming. "
+        "The mask is converted to the GPU kernel's physical block geometry "
+        "only after routing. "
         "It does not replace ModelAttentionBackend: dense self-attention, "
         "cross-attention, and full_video_dense continue through the model's "
         "selected ComfyUI backend. Patch order relative to Configure "
@@ -242,8 +244,18 @@ class FlashVSRStreamingSampler:
                     "VRAM grows sharply with resolution and duration; the "
                     "LCSA controls below are ignored. streaming processes "
                     "bounded overlapping segments and applies FlashVSR LCSA "
-                    "through the model's selected mask-capable attention "
-                    "backend, greatly reducing long-video VRAM. The optional "
+                    "without a DiT KV cache. streaming_faithful_full uses "
+                    "the paper layout: six-frame prefill, two new frames per "
+                    "continuation, and a six-frame sliding KV cache in every "
+                    "Wan block; cache tensors automatically move to CPU when "
+                    "they do not fit conservatively in VRAM. "
+                    "streaming_faithful_lowvram uses the same temporal layout "
+                    "but retains only the nearest two historical frames in "
+                    "every Wan block. This avoids the boundary blur caused by "
+                    "giving early blocks no temporal history while using "
+                    "roughly one third of the full cache. Streaming "
+                    "modes use the model's selected mask-capable attention "
+                    "backend. The optional "
                     "FlashVSR Sparge Attention additionally skips rejected "
                     "key blocks with SpargeAttn instead of applying the "
                     "sparse topology through a dense masked kernel."
@@ -297,16 +309,17 @@ class FlashVSRStreamingSampler:
             }),
         }, "optional": {
             "new_latent_frames": ("INT", {
-                "default": 4,
+                "default": 2,
                 "min": 2,
                 "max": 4,
                 "step": 2,
                 "advanced": True,
                 "tooltip": (
-                    "New latent frames appended per continuation. 4 is the "
-                    "optimized default: it uses six-frame continuations, "
-                    "reducing calls without exceeding the existing six-frame "
-                    "initial peak. Use 2 as the compatibility control."
+                    "New latent frames appended per continuation. 2 matches "
+                    "the FlashVSR paper and is mandatory in both faithful "
+                    "cache modes. Legacy streaming may use 4 to reduce model "
+                    "calls, but this is less faithful to the trained temporal "
+                    "layout."
                 ),
             }),
             "profile_cuda_events": ("BOOLEAN", {
@@ -329,7 +342,7 @@ class FlashVSRStreamingSampler:
     CATEGORY = "FlashVSR/sampling"
 
     def build(self, runtime, sampling_mode, sparse_ratio, local_range,
-              query_block_chunk, new_latent_frames=4,
+              query_block_chunk, new_latent_frames=2,
               profile_cuda_events=False):
         return (
             make_sampler(
