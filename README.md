@@ -1,3 +1,9 @@
+If you're having OOM errors with other ComfyUI FlashVSR nodes, try this one.
+
+A 4x spatial upscale of a 10 second video takes about 6 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' setting in bundled sampler node.
+
+Use 'streaming_faithful_lowvram' in bundled sampler node if bounded by VRAM (i.e. OOM or major slowdown), as KV cache can be costly to offload to RAM. Or, use 'streaming' mode which drops the cache entirely and can be good enough.
+
 # ComfyUI FlashVSR — Stock Wan
 
 FlashVSR v1.1 video super-resolution built around ComfyUI's stock Wan model,
