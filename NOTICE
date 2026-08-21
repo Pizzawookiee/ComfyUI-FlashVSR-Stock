@@ -28,3 +28,10 @@ SpargeAttn is distributed separately under the Apache License 2.0.
 The temporary-attention routing design was informed by ComfyUI-RadialAttn:
 https://github.com/woct0rdho/ComfyUI-RadialAttn
 Copyright (c) 2025, Apache License 2.0.
+
+The feasibility of reusing quantized projection inputs was evaluated against
+the documented behavior of H3-Optimizations:
+https://github.com/Zironic/H3-Optimizations
+No H3-Optimizations source code is incorporated. The FlashVSR QKV and carrier
+implementation in this repository was written independently against ComfyUI
+and Comfy-Kitchen interfaces.

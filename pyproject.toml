@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-flashvsr-stock"
 description = "FlashVSR v1.1 video super-resolution built around ComfyUI's stock Wan implementation."
-version = "0.20.2"
+version = "0.31.0"
 license = { file = "LICENSE.txt" }
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,6 @@ dependencies = [
 Repository = "https://github.com/Pizzawookiee/ComfyUI-FlashVSR-Stock"
 
 [tool.comfy]
-PublisherId = "Pizzawookiee"
+PublisherId = "pizzawookiee"
 DisplayName = "ComfyUI-FlashVSR-Stock"
 Icon = "" # Optional: add a repository-relative PNG, JPG, GIF, or SVG (max 800x400).

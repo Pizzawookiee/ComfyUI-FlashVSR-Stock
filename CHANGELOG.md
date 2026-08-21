@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.31.0
+
+- Restored stock ComfyUI Wan Q/K/V projection as the default streaming path
+  after identifying an FP16/BF16-bias ABI mismatch in the experimental direct
+  CUTLASS projection.
+- Corrected the experimental CUTLASS path to supply FP32 bias, require SM80 or
+  newer, and validate a small Q/K/V output sample against stock projection
+  before continuing.
+- Decoupled faithful cache precision from QKV projection. Stock ComfyUI INT8
+  ConvRot models can now use compact cache carriers without enabling shared
+  QKV projection.
+- Added `int8`, `hybrid`, and `float` cache formats. Hybrid retains K in model
+  precision and stores V as INT8; compact carriers now scale each token/head
+  independently for better attention fidelity.
+- Added bounded per-block GPU cache residency with CPU, conservative,
+  balanced, aggressive, and custom VRAM policies. Individual allocation
+  failures fall back only the affected block to CPU.
+- Expanded sampler tooltips and cache diagnostics with format, residency, and
+  remaining transfer estimates.
+
+## 0.3.0
+
+- Added a clean-room shared ConvRot INT8 QKV projection path for stock Wan.
+  Compatible Q/K/V projections reuse one activation rotation/quantization
+  while remaining separate ComfyUI-managed parameters.
+- Added sequential Dynamic VRAM leases as the low-memory default and a
+  resident shared-carrier path when all three weights are already resident.
+  Both currently use three projection launches.
+- Added compact row-wise INT8 post-RoPE K/V cache carriers for faithful modes,
+  with bounded per-block expansion for ModelAttentionBackend and Sparge.
+- Made faithful carrier storage CPU-first under ComfyUI Dynamic VRAM and kept
+  model weight offloading entirely under ComfyUI/AIMDO.
+- Made faithful cache updates transactional across a complete model chunk.
+- Added guarded stock-projection fallback for non-INT8 checkpoints,
+  incompatible layouts, weight patches, missing Comfy-Kitchen CUDA symbols,
+  and unsupported projection shapes.
+- Added CUDA profiler stages for shared ConvRot quantization, Q/K/V GEMMs,
+  and Q/K normalization plus RoPE.
+
 ## 0.20.2
 
 - Reworked `streaming_faithful_lowvram` to cache the nearest two historical

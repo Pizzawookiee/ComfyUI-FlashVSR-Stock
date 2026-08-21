@@ -1,3 +1,9 @@
+If you're having OOM errors with other ComfyUI FlashVSR nodes, try this one.
+
+A 4x spatial upscale of a 10 second video takes about 6 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' setting in bundled sampler node.
+
+Use 'streaming_faithful_lowvram' in bundled sampler node if bounded by VRAM (i.e. OOM or major slowdown), as KV cache can be costly to offload to RAM. Or, use 'streaming' mode which drops the cache entirely and can be good enough.
+
 # ComfyUI FlashVSR — Stock Wan
 
 FlashVSR v1.1 video super-resolution built around ComfyUI's stock Wan model,
@@ -24,6 +30,12 @@ optional SpargeAttn route for LCSA.
 - Preserves FlashVSR's official causal temporal layout and LQ conditioning.
 - Provides bounded overlap-context sampling, two paper-layout streaming modes
   with sliding DiT KV caches, and a dense reference mode.
+- Uses stock ComfyUI Wan Q, K, and V projections by default, including stock
+  Comfy-Kitchen execution for INT8 ConvRot checkpoints. An output-validated
+  shared-activation projection remains available as an experimental option.
+- Stores faithful temporal history as independently selectable INT8, hybrid,
+  or floating carriers. Bounded per-block GPU residency uses available VRAM
+  while the remaining cache stays on CPU.
 - Routes dense and cross-attention through the model's selected ComfyUI
   attention backend.
 - Optionally executes FlashVSR's LCSA block mask with a separately installed
@@ -37,6 +49,9 @@ optional SpargeAttn route for LCSA.
 ## Requirements
 
 - A current ComfyUI installation with stock Wan support.
+- The Comfy-Kitchen build bundled with that ComfyUI installation. It is used
+  normally by ComfyUI for compatible quantized checkpoints; the optional
+  experimental shared-QKV path is capability-checked.
 - Python 3.10 or newer.
 - An NVIDIA CUDA GPU is strongly recommended.
 - Enough system RAM and VRAM for the chosen resolution and model dtype.
@@ -158,6 +173,10 @@ then fills it through FlashVSR's one-step model calls.
 | `local_range` | Spatial neighborhood, measured in FlashVSR token blocks, from which LCSA may select. | Larger expands accessible spatial context and routing cost. Keep the default for the reference topology. |
 | `query_block_chunk` | Maximum number of 128-token query blocks expanded per dense masked-attention call. `0` auto-selects a conservative value from free VRAM. | Lower reduces transient mask/attention memory but increases launches. Ignored by Sparge. |
 | `new_latent_frames` | New frames appended per continuation call: `2` or `4`. | `2` is the default and is mandatory for faithful modes. `4` is available only as a legacy-streaming throughput option. |
+| `qkv_projection` | `stock` uses ComfyUI's Wan projections; `shared_int8_experimental` reuses one ConvRot activation quantization. | Keep `stock` for release-quality output. The experimental path is validated against stock before use and does not determine cache size. |
+| `cache_format` | Faithful-cache storage: `int8`, `hybrid`, or `float`. | `int8` is smallest; `hybrid` keeps K floating and quantizes V; `float` is the quality/control format. Independent of model dtype and QKV projection. |
+| `cache_vram_policy` | Per-block cache placement: `cpu`, `conservative`, `balanced`, `aggressive`, or `custom`. | Start with `conservative`. More GPU-resident blocks reduce PCIe transfer but leave less attention workspace. |
+| `cache_vram_budget_mb` | Explicit cache VRAM cap for the `custom` policy. | The allocator still keeps a safety reserve and falls individual blocks back to CPU. |
 | `profile_cuda_events` | Prints aggregate CUDA timings for LQ projection, KV staging and writes, model execution, routing, Sparge, and assembly. | Leave off for normal runs; profiling adds bookkeeping and a final synchronization. |
 
 `streaming` bounds the model's temporal working set, but the prepared input,
@@ -172,6 +191,21 @@ once per participating block and continuation; total PCIe traffic and runtime
 therefore grow with clip length. On a 6 GB GPU, start with
 `streaming_faithful_lowvram`. The full mode can use several GiB of system RAM
 at HD output resolutions.
+
+Cache precision is independent of the Wan checkpoint and QKV projection path.
+The default `int8` format stores K and V with per-token/per-head scales. The
+`hybrid` format keeps post-RoPE K in model precision while compacting V, and
+`float` keeps both tensors in model precision. Every format expands or copies
+into the reusable one-block GPU staging buffer before the selected attention
+backend runs, preserving ModelAttentionBackend and current Sparge
+compatibility.
+
+ComfyUI Dynamic VRAM remains the sole owner of model-weight offloading. The
+FlashVSR cache manager handles only mutable temporal carriers, which are not
+model parameters and cannot be registered safely with AIMDO. Cache policies
+therefore use an explicit safety reserve, keep only complete per-block caches
+on GPU, and retain the remainder on CPU. If one GPU cache allocation fails,
+only that block falls back to CPU.
 
 ## Decoder and postprocess settings
 
@@ -196,7 +230,7 @@ attention implementation, dtype, tiling, and decoder.
 
 | Implementation | Integration style | Attention path | Model/VRAM behavior | Best fit |
 | --- | --- | --- | --- | --- |
-| **This repository** | Composable nodes around stock ComfyUI Wan, stock guider/sampler shell, stock VAE option, and `ModelAttentionBackend` | Logical 128×128 LCSA routing; overlap streaming or two-frame streaming with full/final-ten-block KV caching; optional Sparge | Uses ComfyUI model patchers and `comfy.ops`; automatically chooses GPU or block-staged CPU cache storage | Users who want FlashVSR to coexist with stock Wan workflows and backend patches |
+| **This repository** | Composable nodes around stock ComfyUI Wan, stock guider/sampler shell, stock VAE option, and `ModelAttentionBackend` | Logical 128×128 LCSA routing; overlap streaming or two-frame faithful streaming with all-block KV caching; optional Sparge | Uses ComfyUI model patchers and `comfy.ops`; stock QKV is the default, cache precision is independent, and bounded hybrid CPU/GPU residency reduces offload traffic | Users who want FlashVSR to coexist with stock Wan workflows and backend patches |
 | [Official FlashVSR](https://github.com/OpenImagingLab/FlashVSR) | Standalone reference pipeline | Official LCSA with the compiled Block-Sparse-Attention extension | Reference environment and checkpoint layout; not a native ComfyUI graph | Accuracy/reference validation and supported research setup |
 | [1038lab ComfyUI-FlashVSR](https://github.com/1038lab/ComfyUI-FlashVSR) | Turnkey/all-in-one ComfyUI nodes | Optional SageAttention with fallback | Automatic model download, presets, tiling, and audio passthrough | Easiest self-contained setup |
 | [ComfyUI-FlashVSR Ultra Fast](https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast) | Custom FlashVSR pipeline | Sparse Sage; modified attention behavior | Long-video mode, tiled DiT/VAE, unload controls, full/tiny modes | Users prioritizing its integrated low-VRAM/tiled workflow |
@@ -221,9 +255,11 @@ Wan VAE through the stock VAE loader from `ComfyUI/models/vae`.
 Use `streaming` or `streaming_faithful_lowvram`, keep
 `new_latent_frames=2`, use a memory-efficient attention backend, keep Tiny
 Decode at `temporal_batch_size=1`, and test a shorter or lower-resolution
-clip. Faithful CPU cache offload reduces VRAM, not system-RAM use. An
-INT8/ConvRot DiT reduces model-weight residency, but not FP16/BF16 activation
-or K/V-cache storage.
+clip. Faithful CPU cache offload reduces VRAM but still consumes system RAM.
+The default compact cache works independently of checkpoint dtype. If fine
+detail is sensitive to cache quantization, try `hybrid`, then `float`. Reduce
+the cache VRAM policy before lowering resolution if an aggressive policy
+causes an OOM.
 
 ### Attention backend rejects the mask
 
@@ -236,6 +272,34 @@ or install and use the optional FlashVSR Sparge patch.
 CUDA kernels and optional Triton/Sparge components may initialize or compile
 on their first compatible call. Compare repeated runs only after the workflow
 has completed successfully at least once.
+
+## Release notes — 0.31.0
+
+- Restored stock ComfyUI Wan Q/K/V projection as the default and corrected
+  the experimental CUTLASS FP32-bias ABI.
+- Decoupled QKV execution from faithful-cache precision; compact cache storage
+  works with stock projection and any supported checkpoint dtype.
+- Added INT8, float-K/INT8-V hybrid, and floating cache formats. INT8 carrier
+  scales are now per token and attention head.
+- Added bounded per-block CPU/GPU cache placement with explicit VRAM policies
+  and individual-block CPU fallback.
+- Added experimental projection output validation and clearer cache residency
+  and transfer diagnostics.
+
+## Release notes — 0.3.0
+
+- Added a clean-room shared ConvRot INT8 QKV execution path around stock Wan
+  self-attention. Q/K/V remain separate ComfyUI-managed parameters.
+- Added sequential Dynamic VRAM weight leases as the default accelerated path
+  and a resident shared-carrier path when all three weights are already
+  resident. Both currently use three projection launches.
+- Added compact row-wise INT8 post-RoPE K/V carriers for both faithful modes,
+  with bounded per-block expansion for existing attention backends.
+- Made faithful cache placement CPU-first whenever ComfyUI Dynamic VRAM is
+  active; no second model-weight offloader is introduced.
+- Made cache-ring updates transactional so an interrupted block traversal
+  cannot commit a partial temporal step.
+- Added explicit capability/fallback diagnostics and QKV CUDA profiler stages.
 
 ## Release notes — 0.20.2
 

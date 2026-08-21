@@ -8,6 +8,7 @@ import torch
 import comfy.ldm.modules.attention as comfy_attention
 
 from .components import ComponentHandle
+from .qkv import Int8Carrier, carrier_nbytes, install_wan_qkv_patches
 from .sparse_backend import SPARSE_BACKEND_OPTION
 
 
@@ -204,7 +205,13 @@ class FlashVSRKVCache:
         self.history_frames = 0
         self.slot_count = 0
         self.entries = {}
-        self.storage_device = None
+        self.pending_entries = {}
+        self.cache_format = "int8"
+        self.vram_policy = "conservative"
+        self.custom_vram_mb = 0
+        self.block_storage_devices = {}
+        self.gpu_blocks = set()
+        self.bytes_per_block = 0
         self.write_slot = 0
         self.initial_chunk = False
         self.committed_blocks = set()
@@ -217,9 +224,23 @@ class FlashVSRKVCache:
     def enabled(self):
         return bool(self.active_blocks)
 
-    def configure(self, mode, total_blocks):
+    def configure(self, mode, total_blocks, cache_format="int8",
+                  vram_policy="conservative", custom_vram_mb=0):
         self.clear()
         self.mode = mode
+        self.cache_format = str(cache_format)
+        self.vram_policy = str(vram_policy)
+        self.custom_vram_mb = max(0, int(custom_vram_mb or 0))
+        if self.cache_format not in ("int8", "hybrid", "float"):
+            raise ValueError(
+                f"Unknown FlashVSR faithful cache format: {self.cache_format}"
+            )
+        if self.vram_policy not in (
+            "cpu", "conservative", "balanced", "aggressive", "custom"
+        ):
+            raise ValueError(
+                f"Unknown FlashVSR cache VRAM policy: {self.vram_policy}"
+            )
         self.total_blocks = max(0, int(total_blocks or 0))
         if mode == "streaming_faithful_full":
             self.active_blocks = set(range(self.total_blocks))
@@ -248,6 +269,7 @@ class FlashVSRKVCache:
     def begin_chunk(self, initial):
         self.initial_chunk = bool(initial)
         self.committed_blocks.clear()
+        self.pending_entries = {}
 
     def end_chunk(self):
         if not self.enabled:
@@ -259,48 +281,106 @@ class FlashVSRKVCache:
                 "FlashVSR did not update every configured KV-cache block "
                 f"during this model call. Missing block indices: {preview}."
             )
+        if self.initial_chunk:
+            self.entries = self.pending_entries
+        else:
+            for block_index, pending in self.pending_entries.items():
+                self.entries[block_index][self.write_slot] = pending
         if not self.initial_chunk:
             self.write_slot = (self.write_slot + 1) % self.slot_count
+        self.pending_entries = {}
 
     @staticmethod
     def _allocate_copy(source, device):
+        target = torch.device(device)
         destination = torch.empty(
-            source.shape,
-            device=device,
-            dtype=source.dtype,
+            source.shape, device=target, dtype=source.dtype
         )
         destination.copy_(source.detach(), non_blocking=False)
         return destination
 
-    def _choose_storage_device(self, k, slot_tokens):
-        bytes_per_block = (
-            2
-            * k.shape[0]
-            * (self.slot_count * slot_tokens)
-            * k.shape[2]
-            * k.element_size()
+    @staticmethod
+    def _carrier_to(carrier, device):
+        if not isinstance(carrier, Int8Carrier):
+            return FlashVSRKVCache._allocate_copy(carrier, device)
+        target = torch.device(device)
+        return Int8Carrier(
+            carrier.qdata.to(device=target).contiguous(),
+            carrier.scale.to(device=target).contiguous(),
+            carrier.shape,
+            carrier.dtype,
+            carrier.head_dim,
         )
-        # slot_tokens is the token count for two frames. The arithmetic above
-        # is K+V times the mode-specific number of two-frame history slots.
-        self.total_cache_bytes = bytes_per_block * len(self.active_blocks)
-        placement = torch.device("cpu")
+
+    def _cache_value(self, source, device, value_kind, heads):
+        compact = (
+            self.cache_format == "int8"
+            or (self.cache_format == "hybrid" and value_kind == "v")
+        )
+        if compact:
+            return Int8Carrier.from_tensor(source, device, heads)
+        return self._allocate_copy(source, device)
+
+    @staticmethod
+    def _copy_cached_to(cached, destination):
+        if isinstance(cached, Int8Carrier):
+            cached.copy_to(destination)
+        else:
+            destination.copy_(cached, non_blocking=False)
+
+    def _slot_bytes(self, shape, heads, element_size):
+        float_bytes = math.prod(shape) * element_size
+        int8_bytes = carrier_nbytes(shape, heads)
+        if self.cache_format == "int8":
+            return int8_bytes * 2
+        if self.cache_format == "hybrid":
+            return float_bytes + int8_bytes
+        return float_bytes * 2
+
+    def _choose_storage_plan(self, k, slot_tokens, heads):
+        slot_shape = (k.shape[0], slot_tokens, k.shape[2])
+        bytes_per_slot = self._slot_bytes(
+            slot_shape, heads, k.element_size()
+        )
+        self.bytes_per_block = self.slot_count * bytes_per_slot
+        self.total_cache_bytes = (
+            self.bytes_per_block * len(self.active_blocks)
+        )
         free_bytes = None
-        if k.device.type == "cuda":
+        budget = 0
+        if k.device.type == "cuda" and self.vram_policy != "cpu":
             try:
                 free_bytes, total_bytes = torch.cuda.mem_get_info(k.device)
                 reserve = max(
-                    1024 * 1024 * 1024,
+                    1536 * 1024 * 1024,
                     int(total_bytes * 0.20),
                 )
-                conservative_budget = min(
-                    max(0, free_bytes - reserve),
-                    int(free_bytes * 0.35),
-                )
-                if self.total_cache_bytes <= conservative_budget:
-                    placement = k.device
+                available = max(0, free_bytes - reserve)
+                fractions = {
+                    "conservative": 0.25,
+                    "balanced": 0.50,
+                    "aggressive": 0.70,
+                }
+                if self.vram_policy == "custom":
+                    requested = self.custom_vram_mb * 1024 * 1024
+                else:
+                    requested = int(
+                        free_bytes * fractions[self.vram_policy]
+                    )
+                budget = min(available, requested)
             except (RuntimeError, TypeError):
-                placement = torch.device("cpu")
-        self.storage_device = placement
+                budget = 0
+        gpu_count = min(
+            len(self.active_blocks),
+            budget // max(1, self.bytes_per_block),
+        )
+        # Keep complete per-layer histories together. Partial layer slots
+        # complicate failure recovery and do not help the attention API.
+        self.gpu_blocks = set(sorted(self.active_blocks)[:gpu_count])
+        self.block_storage_devices = {
+            block: (k.device if block in self.gpu_blocks else torch.device("cpu"))
+            for block in self.active_blocks
+        }
         if not self.reported:
             first = min(self.active_blocks)
             last = max(self.active_blocks)
@@ -311,71 +391,69 @@ class FlashVSRKVCache:
             print(
                 "[FlashVSR] faithful KV cache: blocks "
                 f"{first}-{last}, history={self.history_frames} frames, "
-                f"storage={placement}, "
+                f"format={self.cache_format}, policy={self.vram_policy}, "
+                f"GPU-resident={len(self.gpu_blocks)}/{len(self.active_blocks)}, "
                 f"estimated={self.total_cache_bytes / (1024 ** 3):.2f} GiB"
                 f"{free_text}."
             )
-            if placement.type == "cpu":
+            cpu_blocks = len(self.active_blocks) - len(self.gpu_blocks)
+            if cpu_blocks:
+                cpu_bytes = self.bytes_per_block * cpu_blocks
                 print(
                     "[FlashVSR] faithful KV cache transfer per "
                     "continuation: approximately "
-                    f"{self.total_cache_bytes / (1024 ** 3):.2f} GiB "
+                    f"{cpu_bytes / (1024 ** 3):.2f} GiB "
                     "CPU->GPU and "
-                    f"{self.total_cache_bytes / self.slot_count / (1024 ** 3):.2f} GiB "
+                    f"{cpu_bytes / self.slot_count / (1024 ** 3):.2f} GiB "
                     "GPU->CPU."
                 )
             self.reported = True
 
-    def _initial_store(self, block_index, k, v, tokens_per_frame):
-        slot_tokens = self.SLOT_FRAMES * tokens_per_frame
-        if self.storage_device is None:
-            self._choose_storage_device(k, slot_tokens)
-        try:
-            slots = self._copy_initial_slots(k, v, slot_tokens)
-        except RuntimeError:
-            if self.storage_device.type != "cuda":
-                raise
-            # The conservative estimate can still be defeated by a later
-            # module workspace or allocator fragmentation. Preserve already
-            # collected history by migrating it once, then retry on CPU.
-            self._migrate_entries_to_cpu()
-            slots = self._copy_initial_slots(k, v, slot_tokens)
-        self.entries[int(block_index)] = slots
-
-    def _copy_initial_slots(self, k, v, slot_tokens):
+    def _copy_initial_slots(self, block_index, k, v, slot_tokens, heads):
         slots = []
         # Full mode retains all six prefill frames. Low-VRAM mode must retain
         # the nearest two prefill frames, so start at the tail of the input.
         history_tokens = self.history_frames * (slot_tokens // self.SLOT_FRAMES)
         history_start = k.shape[1] - history_tokens
+        device = self.block_storage_devices[int(block_index)]
         for slot_index in range(self.slot_count):
             start = history_start + slot_index * slot_tokens
             end = start + slot_tokens
             slots.append((
-                self._allocate_copy(k[:, start:end], self.storage_device),
-                self._allocate_copy(v[:, start:end], self.storage_device),
+                self._cache_value(k[:, start:end], device, "k", heads),
+                self._cache_value(v[:, start:end], device, "v", heads),
             ))
         return slots
 
-    def _migrate_entries_to_cpu(self):
-        migrated = {}
-        for block_index, slots in self.entries.items():
-            migrated[block_index] = [
-                (
-                    self._allocate_copy(cached_k, torch.device("cpu")),
-                    self._allocate_copy(cached_v, torch.device("cpu")),
-                )
-                for cached_k, cached_v in slots
+    def _migrate_block_to_cpu(self, block_index):
+        block_index = int(block_index)
+        if block_index in self.entries:
+            self.entries[block_index] = [
+                (self._carrier_to(a, "cpu"), self._carrier_to(b, "cpu"))
+                for a, b in self.entries[block_index]
             ]
-        self.entries = migrated
-        self.storage_device = torch.device("cpu")
+        if block_index in self.pending_entries:
+            pending = self.pending_entries[block_index]
+            if self.initial_chunk:
+                pending = [
+                    (self._carrier_to(a, "cpu"), self._carrier_to(b, "cpu"))
+                    for a, b in pending
+                ]
+            else:
+                pending = (
+                    self._carrier_to(pending[0], "cpu"),
+                    self._carrier_to(pending[1], "cpu"),
+                )
+            self.pending_entries[block_index] = pending
+        self.block_storage_devices[block_index] = torch.device("cpu")
+        self.gpu_blocks.discard(block_index)
         self.stage_k = None
         self.stage_v = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         print(
-            "[FlashVSR] faithful KV cache fell back to CPU after GPU "
-            "allocation pressure."
+            f"[FlashVSR] faithful KV cache block {block_index} fell back "
+            "to CPU after GPU allocation pressure."
         )
 
     def stage(self, block_index, k, v, tokens_per_frame):
@@ -408,14 +486,18 @@ class FlashVSRKVCache:
             slot_index = (self.write_slot + relative) % self.slot_count
             cached_k, cached_v = slots[slot_index]
             end = offset + current_tokens
-            self.stage_k[:, offset:end].copy_(cached_k, non_blocking=False)
-            self.stage_v[:, offset:end].copy_(cached_v, non_blocking=False)
+            self._copy_cached_to(
+                cached_k, self.stage_k[:, offset:end]
+            )
+            self._copy_cached_to(
+                cached_v, self.stage_v[:, offset:end]
+            )
             offset = end
         self.stage_k[:, history_tokens:].copy_(k, non_blocking=False)
         self.stage_v[:, history_tokens:].copy_(v, non_blocking=False)
         return self.stage_k, self.stage_v
 
-    def commit(self, block_index, k, v, tokens_per_frame):
+    def commit(self, block_index, k, v, tokens_per_frame, heads):
         block_index = int(block_index)
         if self.initial_chunk:
             expected = self.PREFILL_FRAMES * tokens_per_frame
@@ -424,7 +506,21 @@ class FlashVSRKVCache:
                     "FlashVSR initial KV cache requires exactly six latent "
                     "frames."
                 )
-            self._initial_store(block_index, k, v, tokens_per_frame)
+            slot_tokens = self.SLOT_FRAMES * tokens_per_frame
+            if not self.block_storage_devices:
+                self._choose_storage_plan(k, slot_tokens, heads)
+            try:
+                pending = self._copy_initial_slots(
+                    block_index, k, v, slot_tokens, heads
+                )
+            except RuntimeError:
+                if self.block_storage_devices[block_index].type != "cuda":
+                    raise
+                self._migrate_block_to_cpu(block_index)
+                pending = self._copy_initial_slots(
+                    block_index, k, v, slot_tokens, heads
+                )
+            self.pending_entries[block_index] = pending
         else:
             expected = self.SLOT_FRAMES * tokens_per_frame
             if k.shape[1] != expected or v.shape[1] != expected:
@@ -432,20 +528,34 @@ class FlashVSRKVCache:
                     "FlashVSR continuation KV cache requires exactly two "
                     "new latent frames."
                 )
-            slots = self.entries[block_index]
-            cached_k, cached_v = slots[self.write_slot]
-            cached_k.copy_(k.detach(), non_blocking=False)
-            cached_v.copy_(v.detach(), non_blocking=False)
+            try:
+                device = self.block_storage_devices[block_index]
+                pending = (
+                    self._cache_value(k, device, "k", heads),
+                    self._cache_value(v, device, "v", heads),
+                )
+            except RuntimeError:
+                if self.block_storage_devices[block_index].type != "cuda":
+                    raise
+                self._migrate_block_to_cpu(block_index)
+                pending = (
+                    self._cache_value(k, "cpu", "k", heads),
+                    self._cache_value(v, "cpu", "v", heads),
+                )
+            self.pending_entries[block_index] = pending
         self.committed_blocks.add(block_index)
 
     def clear(self):
         self.mode = None
         self.total_blocks = 0
         self.entries = {}
+        self.pending_entries = {}
         self.active_blocks = set()
         self.history_frames = 0
         self.slot_count = 0
-        self.storage_device = None
+        self.block_storage_devices = {}
+        self.gpu_blocks = set()
+        self.bytes_per_block = 0
         self.write_slot = 0
         self.initial_chunk = False
         self.committed_blocks = set()
@@ -485,6 +595,13 @@ class FlashVSRRuntime:
         self.sparse_attention_backend = None
         self.attention_override = StreamingAttentionDispatcher(self)
         self.installed_attention_override = None
+        self.dynamic_vram_active = False
+        self.qkv_projection_mode = "stock"
+        self.int8_qkv_capable = False
+        self.int8_qkv_format = None
+        self.int8_qkv_run_active = False
+        self.int8_qkv_disabled_reason = None
+        self.reported_qkv_path = None
         self.profile_enabled = False
         self.profile_events = {}
         self.profile_devices = set()
@@ -556,6 +673,12 @@ class FlashVSRRuntime:
             "kv_cache_stage_h2d",
             "kv_cache_write_d2h",
             "kv_cached_attention",
+            "qkv_convrot_quant",
+            "qkv_q_gemm",
+            "qkv_k_gemm",
+            "qkv_v_gemm",
+            "qkv_q_norm_rope",
+            "qkv_k_norm_rope",
             "lcsa_routing",
             "sparge_layout_qkv",
             "sparge_mask_convert",
@@ -577,6 +700,12 @@ class FlashVSRRuntime:
             totals.get(name, 0.0) for name in (
                 "kv_cache_stage_h2d",
                 "kv_cache_write_d2h",
+                "qkv_convrot_quant",
+                "qkv_q_gemm",
+                "qkv_k_gemm",
+                "qkv_v_gemm",
+                "qkv_q_norm_rope",
+                "qkv_k_norm_rope",
                 "lcsa_routing",
                 "sparge_layout_qkv",
                 "sparge_mask_convert",
@@ -701,12 +830,60 @@ class FlashVSRRuntime:
     def set_total_wan_blocks(self, count):
         self.total_wan_blocks = max(0, int(count))
 
+    def set_dynamic_vram(self, enabled):
+        self.dynamic_vram_active = bool(enabled)
+
+    def configure_int8_qkv(self, format_info):
+        self.int8_qkv_format = format_info
+        self.int8_qkv_capable = format_info is not None
+        self.int8_qkv_disabled_reason = None
+        if format_info is None:
+            print(
+                "[FlashVSR] shared QKV: stock projection fallback "
+                "(the complete Wan self-attention stack is not compatible "
+                "TensorWise INT8 ConvRot)."
+            )
+
+    def note_qkv_path(self, path):
+        self.int8_qkv_run_active = True
+        if path == self.reported_qkv_path:
+            return
+        self.reported_qkv_path = path
+        dynamic = "on" if self.dynamic_vram_active else "off"
+        print(
+            f"[FlashVSR] shared QKV path: {path}; "
+            f"ComfyUI Dynamic VRAM={dynamic}."
+        )
+
+    def disable_int8_qkv(self, reason):
+        self.int8_qkv_capable = False
+        self.int8_qkv_run_active = False
+        self.int8_qkv_disabled_reason = str(reason)
+        if self.reported_qkv_path != "stock_fallback":
+            print(
+                "[FlashVSR] shared QKV fell back to stock Wan: "
+                f"{self.int8_qkv_disabled_reason}."
+            )
+            self.reported_qkv_path = "stock_fallback"
+
     def begin_sampling(self, streaming: bool, sampling_mode=None,
                        sparse_ratio: float = 2.0,
                        local_range: int = 11,
-                       query_block_chunk: int = 1):
+                       query_block_chunk: int = 1,
+                       qkv_projection: str = "stock",
+                       cache_format: str = "int8",
+                       cache_vram_policy: str = "conservative",
+                       cache_vram_budget_mb: int = 0):
         self.streaming_active = streaming
         self.sampling_mode = sampling_mode
+        self.qkv_projection_mode = str(qkv_projection)
+        if self.qkv_projection_mode not in (
+            "stock", "shared_int8_experimental"
+        ):
+            raise ValueError(
+                f"Unknown FlashVSR QKV projection mode: "
+                f"{self.qkv_projection_mode}"
+            )
         self.lcsa_sparse_ratio = max(0.1, float(sparse_ratio))
         self.lcsa_local_range = max(1, int(local_range))
         # Zero selects a conservative value from the free CUDA memory seen by
@@ -722,7 +899,22 @@ class FlashVSRRuntime:
             )
             else None
         )
-        self.kv_cache.configure(faithful_mode, self.total_wan_blocks)
+        self.kv_cache.configure(
+            faithful_mode,
+            self.total_wan_blocks,
+            cache_format=cache_format,
+            vram_policy=cache_vram_policy,
+            custom_vram_mb=cache_vram_budget_mb,
+        )
+        if streaming:
+            capability = (
+                "available" if self.int8_qkv_format is not None
+                else "unavailable"
+            )
+            print(
+                f"[FlashVSR] QKV projection={self.qkv_projection_mode} "
+                f"(experimental shared path {capability})."
+            )
 
     def begin_model_chunk(self):
         self.seen_self_attention_blocks.clear()
@@ -796,7 +988,7 @@ class FlashVSRRuntime:
         if cache_active:
             cache_marker = self.profile_start(current_k)
             self.kv_cache.commit(
-                block_index, current_k, current_v, tokens_per_frame
+                block_index, current_k, current_v, tokens_per_frame, heads
             )
             self.profile_end("kv_cache_write_d2h", cache_marker)
         return attended
@@ -1167,6 +1359,9 @@ class FlashVSRRuntime:
         self.sampling_mode = None
         self.resolved_lcsa_query_block_chunk = {}
         self.seen_self_attention_blocks.clear()
+        self.int8_qkv_run_active = False
+        self.int8_qkv_disabled_reason = None
+        self.int8_qkv_capable = self.int8_qkv_format is not None
         self.kv_cache.clear()
         self.lq.model.clear_cache()
 
@@ -1472,16 +1667,24 @@ class _FlashVSRBlock0Patch:
 
 def patch_model(model, runtime: FlashVSRRuntime):
     patched = model.clone()
+    blocks = None
     try:
         blocks = patched.get_model_object("diffusion_model.blocks")
         runtime.set_total_wan_blocks(len(blocks))
     except (AttributeError, KeyError, TypeError, RuntimeError):
         try:
-            runtime.set_total_wan_blocks(
-                len(patched.model.diffusion_model.blocks)
-            )
+            blocks = patched.model.diffusion_model.blocks
+            runtime.set_total_wan_blocks(len(blocks))
         except (AttributeError, TypeError, RuntimeError):
             runtime.set_total_wan_blocks(0)
+    try:
+        runtime.set_dynamic_vram(patched.is_dynamic())
+    except (AttributeError, TypeError, RuntimeError):
+        runtime.set_dynamic_vram(False)
+    if blocks is not None:
+        install_wan_qkv_patches(patched, runtime, blocks)
+    else:
+        runtime.configure_int8_qkv(None)
     patched.set_model_patch_replace(
         _FlashVSRBlock0Patch(runtime), "dit", "double_block", 0
     )

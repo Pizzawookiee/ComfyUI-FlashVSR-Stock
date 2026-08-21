@@ -12,7 +12,13 @@ from .components import load_lq_projector, load_tcdecoder
 from .color import apply_color_correction
 from .model_paths import component_filenames, full_path
 from .runtime import FlashVSRRuntime, patch_model, prepare_video
-from .sampler import SAMPLING_MODES, make_sampler
+from .sampler import (
+    CACHE_FORMATS,
+    CACHE_VRAM_POLICIES,
+    QKV_PROJECTION_MODES,
+    SAMPLING_MODES,
+    make_sampler,
+)
 from .sparse_backend import apply_sparge_backend
 
 
@@ -175,6 +181,14 @@ class FlashVSRPrepareVideo:
 
 
 class FlashVSRApply:
+    DESCRIPTION = (
+        "Injects FlashVSR LQ conditioning into a stock Wan model. Compatible "
+        "TensorWise INT8 ConvRot checkpoints automatically reuse one INT8 "
+        "activation preparation across Q/K/V during streaming. Q/K/V remain "
+        "separate ComfyUI-managed weights, so Dynamic VRAM can lease them "
+        "sequentially; non-compatible checkpoints use stock projections."
+    )
+
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
@@ -247,8 +261,8 @@ class FlashVSRStreamingSampler:
                     "without a DiT KV cache. streaming_faithful_full uses "
                     "the paper layout: six-frame prefill, two new frames per "
                     "continuation, and a six-frame sliding KV cache in every "
-                    "Wan block; cache tensors automatically move to CPU when "
-                    "they do not fit conservatively in VRAM. "
+                    "Wan block. Cache precision and CPU/GPU residency are "
+                    "configured independently below. "
                     "streaming_faithful_lowvram uses the same temporal layout "
                     "but retains only the nearest two historical frames in "
                     "every Wan block. This avoids the boundary blur caused by "
@@ -328,11 +342,61 @@ class FlashVSRStreamingSampler:
                 "tooltip": (
                     "Print synchronized CUDA-event timings after sampling "
                     "for LQ transfers, pixel unshuffle, Conv3d, norm/SiLU, "
-                    "cache updates and linear projection; complete Wan "
+                    "cache updates and linear projection; shared ConvRot "
+                    "quantization, Q/K/V GEMMs, Q/K norm/RoPE; complete Wan "
                     "calls; LCSA routing; Sparge layout/mask/kernel/restore; "
                     "and result assembly. It also prints LQ weight residency "
                     "and verifies BasicGuider/CFG=1 pass count. Off adds no "
                     "CUDA events; on is intended for benchmarking."
+                ),
+            }),
+            # Keep new controls after the two legacy optional widgets so old
+            # workflow JSON retains its positional widget values.
+            "qkv_projection": (QKV_PROJECTION_MODES, {
+                "default": "stock",
+                "advanced": True,
+                "tooltip": (
+                    "stock uses ComfyUI's proven Wan Q/K/V Linear calls and "
+                    "still uses an INT8 ConvRot checkpoint normally. "
+                    "shared_int8_experimental reuses one ConvRot activation "
+                    "quantization across Q/K/V; it is capability-guarded but "
+                    "remains experimental. It does not control cache size."
+                ),
+            }),
+            "cache_format": (CACHE_FORMATS, {
+                "default": "int8",
+                "advanced": True,
+                "tooltip": (
+                    "Faithful modes only. int8 stores post-RoPE K and V as "
+                    "independent per-token/per-head INT8 carriers (smallest). "
+                    "hybrid keeps K in model precision and stores V as INT8 "
+                    "to protect attention scores. float keeps both in model "
+                    "precision (largest). This is independent of QKV "
+                    "projection and checkpoint dtype."
+                ),
+            }),
+            "cache_vram_policy": (CACHE_VRAM_POLICIES, {
+                "default": "conservative",
+                "advanced": True,
+                "tooltip": (
+                    "Faithful modes only. Keeps complete per-block caches on "
+                    "GPU up to a bounded budget and the remainder on CPU. "
+                    "cpu uses no persistent cache VRAM; conservative, "
+                    "balanced, and aggressive use up to 25%, 50%, and 70% "
+                    "of currently free VRAM while retaining a safety reserve. "
+                    "custom uses cache_vram_budget_mb."
+                ),
+            }),
+            "cache_vram_budget_mb": ("INT", {
+                "default": 0,
+                "min": 0,
+                "max": 65536,
+                "step": 128,
+                "advanced": True,
+                "tooltip": (
+                    "Maximum cache VRAM in MiB when cache_vram_policy is "
+                    "custom. The allocator still preserves its safety "
+                    "reserve and falls individual blocks back to CPU."
                 ),
             }),
         }}
@@ -343,12 +407,22 @@ class FlashVSRStreamingSampler:
 
     def build(self, runtime, sampling_mode, sparse_ratio, local_range,
               query_block_chunk, new_latent_frames=2,
-              profile_cuda_events=False):
+              profile_cuda_events=False, qkv_projection="stock",
+              cache_format="int8", cache_vram_policy="conservative",
+              cache_vram_budget_mb=0):
         return (
             make_sampler(
-                runtime, sampling_mode, sparse_ratio,
-                local_range, query_block_chunk, new_latent_frames,
-                profile_cuda_events,
+                runtime=runtime,
+                sampling_mode=sampling_mode,
+                sparse_ratio=sparse_ratio,
+                local_range=local_range,
+                query_block_chunk=query_block_chunk,
+                new_latent_frames=new_latent_frames,
+                profile_cuda_events=profile_cuda_events,
+                qkv_projection=qkv_projection,
+                cache_format=cache_format,
+                cache_vram_policy=cache_vram_policy,
+                cache_vram_budget_mb=cache_vram_budget_mb,
             ),
             torch.tensor([1.0, 0.0], dtype=torch.float32),
         )
