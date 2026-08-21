@@ -1115,7 +1115,7 @@
         807.9759351313417
       ]
     },
-    "workflow_notes": "Select an input video in VHS_LoadVideo. ModelAttentionBackend must remain before FlashVSRApply. Replace it with Patch Sage Attention KJ in the same position if desired. Connect the cropped IMAGE output to your preferred video-combine node for export.",
+    "workflow_notes": "Select an input video in LoadVideo. ModelAttentionBackend must remain before FlashVSRApply. Replace it with Patch Sage Attention KJ in the same position if desired. Connect the cropped IMAGE output to your preferred video-combine node for export.",
     "frontendVersion": "1.48.7"
   },
   "version": 0.4
