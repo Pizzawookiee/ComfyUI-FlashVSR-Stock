@@ -1,6 +1,6 @@
 If you're having OOM errors with other ComfyUI FlashVSR nodes, try this one.
 
-A 4x spatial upscale of a 10 second video takes about 6 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' setting in bundled sampler node.
+A 4x spatial upscale of a 10 second video takes about 7 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' sampler mode in bundled sampler node.
 
 Use 'streaming_faithful_lowvram' in bundled sampler node if bounded by VRAM (i.e. OOM or major slowdown), as KV cache can be costly to offload to RAM. Or, use 'streaming' mode which drops the cache entirely and can be good enough.
 
@@ -166,7 +166,7 @@ then fills it through FlashVSR's one-step model calls.
 | Setting | Meaning | Practical guidance |
 | --- | --- | --- |
 | `sampling_mode=full_video_dense` | Projects and samples the whole video in one dense-attention call. | Reference/control mode. Usually faster for small clips but VRAM grows strongly with clip length and resolution. |
-| `sampling_mode=streaming` | Six latent frames are evaluated first; later calls recompute two overlap frames and append two or four new frames. There is no DiT KV cache. | Proven compatibility mode. Peak attention memory is bounded by segment size. |
+| `sampling_mode=streaming` | Six latent frames are evaluated first; later calls recompute two overlap frames and append two or four new frames. There is no DiT KV cache. | Proven compatibility mode, generally the fastest sampling mode. Peak attention memory is bounded by segment size. |
 | `sampling_mode=streaming_faithful_full` | Six-frame prefill followed by exactly two new frames per call. Every Wan block retains a sliding six-frame post-RoPE K/V history. | Closest mode to the paper. Cache storage automatically falls back to CPU when the complete cache does not fit conservatively in VRAM. Highest RAM and transfer cost. |
 | `sampling_mode=streaming_faithful_lowvram` | Uses the faithful two-frame continuation layout and retains the nearest two historical frames in every Wan block. | Low-VRAM compromise that preserves immediate temporal context throughout the DiT. Roughly one third of the full six-frame cache, but with less long-range history than paper inference. |
 | `sparse_ratio` | Global LCSA selection budget. Larger values retain more eligible key blocks. | Higher may preserve more context but increases sparse work. It is not a percentage. Keep the default unless testing quality/performance. |
@@ -286,7 +286,7 @@ has completed successfully at least once.
 - Added experimental projection output validation and clearer cache residency
   and transfer diagnostics.
 
-## Release notes — 0.3.0
+## Release notes — 0.30.0
 
 - Added a clean-room shared ConvRot INT8 QKV execution path around stock Wan
   self-attention. Q/K/V remain separate ComfyUI-managed parameters.
