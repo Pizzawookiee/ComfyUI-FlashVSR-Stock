@@ -1,8 +1,8 @@
 If you're having OOM errors with other ComfyUI FlashVSR nodes, try this one.
 
-A 4x spatial upscale of a 10 second video takes about 6 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' setting in bundled sampler node.
+A 4x spatial upscale of a 10 second 0.4 MP video takes 5 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' sampler mode in bundled sampler node.
 
-Use 'streaming_faithful_lowvram' in bundled sampler node if bounded by VRAM (i.e. OOM or major slowdown), as KV cache can be costly to offload to RAM. Or, use 'streaming' mode which drops the cache entirely and can be good enough.
+Switch to 'streaming_faithful_lowvram' in bundled sampler node for more faithful implementation while bounded by VRAM (i.e. OOM or major slowdown); default is 'streaming' as that drops KV cache entirely and uses the least RAM with good enough results.
 
 # ComfyUI FlashVSR — Stock Wan
 
@@ -34,8 +34,8 @@ optional SpargeAttn route for LCSA.
   Comfy-Kitchen execution for INT8 ConvRot checkpoints. An output-validated
   shared-activation projection remains available as an experimental option.
 - Stores faithful temporal history as independently selectable INT8, hybrid,
-  or floating carriers. Bounded per-block GPU residency uses available VRAM
-  while the remaining cache stays on CPU.
+  or floating carriers. CPU is always authoritative; an optional AIMDO VBAR
+  can retain evictable GPU mirrors without a fixed cache-VRAM budget.
 - Routes dense and cross-attention through the model's selected ComfyUI
   attention backend.
 - Optionally executes FlashVSR's LCSA block mask with a separately installed
@@ -45,6 +45,14 @@ optional SpargeAttn route for LCSA.
 - Includes crop-only, AdaIN, quarter-resolution wavelet, and full-resolution
   wavelet postprocessing.
 - Includes an optional CUDA-event profiler for sampler diagnosis.
+- Faithful INT8 caches paired with the private Sparge route reuse cached K
+  summaries and dequantize carriers directly into final HND kernel buffers.
+- Compatible Sparge lower kernels can consume native block-INT8 K and, on
+  FP8 architectures, directly materialized transposed-FP8 V without complete
+  floating-point history buffers.
+- Bounded asynchronous cache write-through preserves AIMDO-controlled
+  residency; no Wan block is manually selected to remain on the GPU.
+- Includes an independent optional CUDA-event profiler for TCDecoder.
 
 ## Requirements
 
@@ -56,6 +64,10 @@ optional SpargeAttn route for LCSA.
 - An NVIDIA CUDA GPU is strongly recommended.
 - Enough system RAM and VRAM for the chosen resolution and model dtype.
 - FlashVSR v1.1 safetensors (not bundled).
+
+The experimental AIMDO cache-residency backend additionally requires a
+current ComfyUI build with AIMDO available and enabled. It is optional: the
+default `cpu` backend does not import or initialize `comfy_aimdo`.
 
 ## Installation
 
@@ -134,6 +146,19 @@ If the wheel is missing or incompatible, remove the `FlashVSR Sparge
 Attention` node and use a mask-capable ComfyUI attention backend. Sparge is not
 bundled in this repository.
 
+> [!WARNING]
+> The v0.34 native compact-cache adapter targets RTX 4000-series GPUs (SM89).
+> Sparge exposes related lower ABIs for SM80,
+> SM86, SM87, SM90, SM100, SM120, and SM121, and v0.34 parameterizes their
+> documented block/V formats, but these non-RTX-4000 paths are **untested by
+> this project**. A missing symbol, unsupported layout, or conversion error
+> disables the native route and restores the v0.33 compatibility path.
+
+Compatible SM89-family kernels receive native block-INT8 K and directly
+materialized transposed-FP8 V. SM80/86/87 use native K but retain FP16 V
+because that is what Sparge's Ampere kernel accepts. SM90 uses its separate
+64-query/128-key FP8 ABI.
+
 ## Example workflow
 
 Open [`workflows/FlashVSR_Stock_Wan_Workflow.json`](workflows/FlashVSR_Stock_Wan_Workflow.json)
@@ -166,8 +191,8 @@ then fills it through FlashVSR's one-step model calls.
 | Setting | Meaning | Practical guidance |
 | --- | --- | --- |
 | `sampling_mode=full_video_dense` | Projects and samples the whole video in one dense-attention call. | Reference/control mode. Usually faster for small clips but VRAM grows strongly with clip length and resolution. |
-| `sampling_mode=streaming` | Six latent frames are evaluated first; later calls recompute two overlap frames and append two or four new frames. There is no DiT KV cache. | Proven compatibility mode. Peak attention memory is bounded by segment size. |
-| `sampling_mode=streaming_faithful_full` | Six-frame prefill followed by exactly two new frames per call. Every Wan block retains a sliding six-frame post-RoPE K/V history. | Closest mode to the paper. Cache storage automatically falls back to CPU when the complete cache does not fit conservatively in VRAM. Highest RAM and transfer cost. |
+| `sampling_mode=streaming` | Six latent frames are evaluated first; later calls recompute two overlap frames and append two or four new frames. There is no DiT KV cache. | Proven compatibility mode, generally the fastest sampling mode. Peak attention memory is bounded by segment size. |
+| `sampling_mode=streaming_faithful_full` | Six-frame prefill followed by exactly two new frames per call. Every Wan block retains a sliding six-frame post-RoPE K/V history. | Closest mode to the paper. CPU residency is the reliable default; optional AIMDO residency can avoid transfers for pages that remain mapped. Highest RAM and transfer cost. |
 | `sampling_mode=streaming_faithful_lowvram` | Uses the faithful two-frame continuation layout and retains the nearest two historical frames in every Wan block. | Low-VRAM compromise that preserves immediate temporal context throughout the DiT. Roughly one third of the full six-frame cache, but with less long-range history than paper inference. |
 | `sparse_ratio` | Global LCSA selection budget. Larger values retain more eligible key blocks. | Higher may preserve more context but increases sparse work. It is not a percentage. Keep the default unless testing quality/performance. |
 | `local_range` | Spatial neighborhood, measured in FlashVSR token blocks, from which LCSA may select. | Larger expands accessible spatial context and routing cost. Keep the default for the reference topology. |
@@ -175,8 +200,7 @@ then fills it through FlashVSR's one-step model calls.
 | `new_latent_frames` | New frames appended per continuation call: `2` or `4`. | `2` is the default and is mandatory for faithful modes. `4` is available only as a legacy-streaming throughput option. |
 | `qkv_projection` | `stock` uses ComfyUI's Wan projections; `shared_int8_experimental` reuses one ConvRot activation quantization. | Keep `stock` for release-quality output. The experimental path is validated against stock before use and does not determine cache size. |
 | `cache_format` | Faithful-cache storage: `int8`, `hybrid`, or `float`. | `int8` is smallest; `hybrid` keeps K floating and quantizes V; `float` is the quality/control format. Independent of model dtype and QKV projection. |
-| `cache_vram_policy` | Per-block cache placement: `cpu`, `conservative`, `balanced`, `aggressive`, or `custom`. | Start with `conservative`. More GPU-resident blocks reduce PCIe transfer but leave less attention workspace. |
-| `cache_vram_budget_mb` | Explicit cache VRAM cap for the `custom` policy. | The allocator still keeps a safety reserve and falls individual blocks back to CPU. |
+| `cache_residency_backend` | `cpu` always stages from the authoritative system-RAM cache. `aimdo_experimental` adds a dedicated, deprioritized AIMDO VBAR as an evictable GPU mirror (i.e. automatic GPU staging if there is VRAM available) | Start with `cpu` for reliability. AIMDO resident hits avoid PCIe staging; misses, stale mappings, initialization failures, and per-access faults fall back to the same CPU data. |
 | `profile_cuda_events` | Prints aggregate CUDA timings for LQ projection, KV staging and writes, model execution, routing, Sparge, and assembly. | Leave off for normal runs; profiling adds bookkeeping and a final synchronization. |
 
 `streaming` bounds the model's temporal working set, but the prepared input,
@@ -195,17 +219,31 @@ at HD output resolutions.
 Cache precision is independent of the Wan checkpoint and QKV projection path.
 The default `int8` format stores K and V with per-token/per-head scales. The
 `hybrid` format keeps post-RoPE K in model precision while compacting V, and
-`float` keeps both tensors in model precision. Every format expands or copies
-into the reusable one-block GPU staging buffer before the selected attention
-backend runs, preserving ModelAttentionBackend and current Sparge
-compatibility.
+`float` keeps both tensors in model precision. With `int8` plus `FlashVSR
+Sparge Attention`, cached K summaries drive routing. The v0.34 native route
+converts cached K directly to Sparge block-INT8 using one fixed post-RoPE
+prefill reference mean per Wan layer. On Sparge's FP8 families, cached V is
+materialized directly into the final transposed-FP8 allocation. Hybrid/float
+caches, dense ModelAttentionBackend paths, and failed native capability checks
+retain the reusable v0.33 compatibility materialization.
 
 ComfyUI Dynamic VRAM remains the sole owner of model-weight offloading. The
-FlashVSR cache manager handles only mutable temporal carriers, which are not
-model parameters and cannot be registered safely with AIMDO. Cache policies
-therefore use an explicit safety reserve, keep only complete per-block caches
-on GPU, and retain the remainder on CPU. If one GPU cache allocation fails,
-only that block falls back to CPU.
+FlashVSR cache manager handles only mutable temporal carriers. In `cpu` mode,
+every carrier remains in system RAM. In `aimdo_experimental` mode, FlashVSR
+creates a separate lower-priority packed VBAR; CPU remains authoritative and
+each VBAR mapping is validated before use. Continuation writes are
+transactional and write through to a resident mirror when possible. A page
+fault miss falls back for that access, while an AIMDO initialization or API
+failure disables the mirror for the rest of the run. This avoids a second
+hand-written model-weight offloader and lets AIMDO reclaim cache pages before
+higher-priority model pages.
+
+INT8 continuation writes use a two-slot pinned staging ring and dedicated CUDA
+transfer stream. Completed data is copied into ordinary CPU RAM by bounded
+background workers before the cache transaction commits. AIMDO still chooses
+residency, and CPU remains a complete fallback. The full cache is never pinned.
+Starting ComfyUI with `--disable-pinned-memory`, or any pinned allocation
+failure, automatically restores synchronous write-through.
 
 ## Decoder and postprocess settings
 
@@ -215,6 +253,18 @@ only that block falls back to CPU.
   convolution utilization but increases activation memory.
 - Stock Wan VAE decode is the quality reference. Tiny Decode is faster but is
   a different decoder and may not match the stock VAE exactly.
+- `profile_cuda_events` on `FlashVSR Tiny Decode` prints resolution-grouped
+  TCDecoder stages, wall time, throughput, and peak allocated/reserved VRAM.
+  Leave it disabled normally because it performs a final synchronization.
+- `compile_memblocks` is an experimental `torch.compile`/Inductor path for
+  static TCDecoder MemBlocks only. It has a slower first invocation and
+  automatically falls back to eager execution after a setup/runtime failure.
+- `color_device=auto` uses bounded FP16 CUDA chunks when CUDA is available;
+  choose `cpu` for the compatibility path. `inplace_correction=true` avoids a
+  second complete output-video allocation but should be disabled if another
+  workflow branch consumes the uncorrected decoder output.
+- `profile_stages` on `FlashVSR Postprocess` prints transfer, downsample,
+  lowpass, upsample/correction, clamp and output timing plus complete wall time.
 - `adain` is the inexpensive color correction.
 - `wavelet_quarter_res` applies the five-level low-frequency correction at a
   reduced working resolution and is the practical wavelet mode.
@@ -257,9 +307,9 @@ Use `streaming` or `streaming_faithful_lowvram`, keep
 Decode at `temporal_batch_size=1`, and test a shorter or lower-resolution
 clip. Faithful CPU cache offload reduces VRAM but still consumes system RAM.
 The default compact cache works independently of checkpoint dtype. If fine
-detail is sensitive to cache quantization, try `hybrid`, then `float`. Reduce
-the cache VRAM policy before lowering resolution if an aggressive policy
-causes an OOM.
+detail is sensitive to cache quantization, try `hybrid`, then `float`. If the
+experimental AIMDO mirror contributes to memory pressure, switch
+`cache_residency_backend` to `cpu` before lowering resolution.
 
 ### Attention backend rejects the mask
 
@@ -272,6 +322,52 @@ or install and use the optional FlashVSR Sparge patch.
 CUDA kernels and optional Triton/Sparge components may initialize or compile
 on their first compatible call. Compare repeated runs only after the workflow
 has completed successfully at least once.
+
+## Release notes — 0.35.0
+
+- Fixed inference-mode compatibility in asynchronous cache write-through.
+- Computes cached K routing summaries directly from live K and reduces FP8 V
+  scale-workspace allocation.
+- Added guarded, opt-in TCDecoder MemBlock `torch.compile` support. (Currently works, but returns lots of warnings and performance gain is minimal.)
+- Added bounded GPU FP16 postprocessing, optional in-place correction and a
+  Postprocess stage profiler.
+- Quarter-resolution wavelet now downsamples before forming the color
+  difference.
+
+## Release notes — 0.34.0
+
+- Added guarded native row-INT8 → block-INT8 K preparation with a fixed
+  per-layer prefill reference mean.
+- Added direct row-INT8 → transposed-FP8 V materialization for Sparge's FP8
+  lower ABIs. RTX 4000 / SM89 is the target; every other SM path is untested.
+- Added bounded asynchronous CPU cache write-through without manual GPU block
+  placement, preserving AIMDO as the residency decision-maker.
+- Added native K/V and asynchronous write profiler stages.
+- Added an optional detailed TCDecoder CUDA profiler.
+- Preserved v0.33 compatibility fallbacks for unsupported native paths.
+
+## Release notes — 0.33.0
+
+- Added per-slot cached K summaries for faithful INT8 LCSA routing.
+- Added a descriptor-based cache handoff to the private Sparge route.
+- Dequantizes compact historical K/V directly into final HND allocations,
+  eliminating redundant FP16/BF16 cache staging on faithful continuations.
+- Extended CUDA profiling with compact H2D, direct HND dequantization/current
+  layout, and Sparge input-cast, K-smoothing, Q/K-quantization, LUT,
+  V-transpose, V-FP8-quantization, and lower CUDA-attention stages.
+- Preserved the v0.32 path for float/hybrid caches, dense attention, and the
+  initial six-frame prefill.
+
+## Release notes — 0.32.0
+
+- Replaced manual faithful-cache VRAM policies and budgets with a single
+  `cache_residency_backend` choice: reliable CPU staging or experimental
+  AIMDO residency.
+- Added a dedicated, deprioritized, packed AIMDO VBAR for mutable K/V cache
+  mirrors. CPU data remains authoritative and every access has a CPU fallback.
+- Added mapping-generation validation, transactional continuation updates,
+  per-run AIMDO failure fallback, and residency/hit/miss diagnostics.
+- Kept cache format and QKV projection independent of cache residency.
 
 ## Release notes — 0.31.0
 
@@ -286,7 +382,7 @@ has completed successfully at least once.
 - Added experimental projection output validation and clearer cache residency
   and transfer diagnostics.
 
-## Release notes — 0.3.0
+## Release notes — 0.30.0
 
 - Added a clean-room shared ConvRot INT8 QKV execution path around stock Wan
   self-attention. Q/K/V remain separate ComfyUI-managed parameters.

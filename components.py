@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import time
 from typing import Optional
 
 import torch
@@ -342,12 +343,114 @@ def _identity_conv(operations, channels, device=None, dtype=None):
     return layer
 
 
+class _TCDecoderProfiler:
+    """Low-overhead CUDA-event profiler local to one decoder invocation."""
+
+    def __init__(self, enabled, device, temporal_batch_size):
+        self.device = torch.device(device)
+        self.enabled = bool(
+            enabled and self.device.type == "cuda" and torch.cuda.is_available()
+        )
+        self.events = {}
+        self.wall_start = time.perf_counter()
+        self.temporal_batch_size = int(temporal_batch_size)
+        self.start_allocated = 0
+        self.start_reserved = 0
+        if self.enabled:
+            with torch.cuda.device(self.device):
+                self.start_allocated = torch.cuda.memory_allocated(self.device)
+                self.start_reserved = torch.cuda.memory_reserved(self.device)
+                torch.cuda.reset_peak_memory_stats(self.device)
+
+    def start(self):
+        if not self.enabled:
+            return None
+        with torch.cuda.device(self.device):
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+        return event
+
+    def end(self, name, start):
+        if start is None:
+            return
+        with torch.cuda.device(self.device):
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+        self.events.setdefault(name, []).append((start, end))
+
+    @staticmethod
+    def block_name(block, current, base_height):
+        scale = max(1, int(round(current.shape[-2] / max(1, base_height))))
+        if isinstance(block, MemBlock):
+            return f"tc_memblock_{scale}x"
+        if isinstance(block, nn.Upsample):
+            return f"tc_upsample_{scale}x"
+        if isinstance(block, (TGrow, FusedTGrowConv)):
+            return f"tc_tgrow_{scale}x"
+        if isinstance(block, nn.Conv2d):
+            return f"tc_conv_{scale}x"
+        return f"tc_elementwise_{scale}x"
+
+    def finish(self, latent_frames, output_frames):
+        if not self.enabled:
+            return
+        torch.cuda.synchronize(self.device)
+        wall_ms = (time.perf_counter() - self.wall_start) * 1000.0
+        totals = {
+            name: sum(start.elapsed_time(end) for start, end in records)
+            for name, records in self.events.items()
+        }
+        counts = {name: len(records) for name, records in self.events.items()}
+        print(
+            "[FlashVSR TC profiler] "
+            f"temporal_batch_size={self.temporal_batch_size}, "
+            f"latent_frames={latent_frames}, output_frames={output_frames}."
+        )
+        print(f"[FlashVSR TC profiler]   wall_total: {wall_ms:.2f} ms")
+        preferred = (
+            "tc_decode_cuda_total",
+            "tc_condition_transfer",
+            "tc_pixel_unshuffle",
+            "tc_latent_pack_normalize",
+            "tc_state_update",
+            "tc_crop_clamp",
+            "tc_output_staging",
+            "tc_output_copy",
+        )
+        ordered = list(preferred) + sorted(
+            name for name in totals if name not in preferred
+        )
+        for name in ordered:
+            if name not in totals:
+                continue
+            total = totals[name]
+            count = counts[name]
+            print(
+                f"[FlashVSR TC profiler]   {name}: {total:.2f} ms "
+                f"({count} calls, {total / count:.2f} ms/call)"
+            )
+        peak_allocated = torch.cuda.max_memory_allocated(self.device)
+        peak_reserved = torch.cuda.max_memory_reserved(self.device)
+        print(
+            "[FlashVSR TC profiler]   memory: "
+            f"start_allocated={self.start_allocated / (1024 ** 2):.0f} MiB, "
+            f"peak_allocated={peak_allocated / (1024 ** 2):.0f} MiB, "
+            f"start_reserved={self.start_reserved / (1024 ** 2):.0f} MiB, "
+            f"peak_reserved={peak_reserved / (1024 ** 2):.0f} MiB."
+        )
+        if output_frames:
+            print(
+                "[FlashVSR TC profiler]   throughput: "
+                f"{wall_ms / output_frames:.2f} ms/output frame."
+            )
+
+
 class TCDecoder(ManagedComponent):
     image_channels = 3
 
     def __init__(self, operations, compute_dtype, device=None,
                  weight_dtype=None, fuse_tgrow=False,
-                 channels_last=False):
+                 channels_last=False, compile_memblocks=False):
         super().__init__(compute_dtype)
         channels = [512, 256, 128, 128]
         latent_channels = 16 + 768
@@ -375,6 +478,10 @@ class TCDecoder(ManagedComponent):
         self.decoder = self._deepen(base, operations, device, weight_dtype)
         self.fuse_tgrow = bool(fuse_tgrow)
         self.use_channels_last = bool(channels_last)
+        self.compile_memblocks = bool(compile_memblocks)
+        self._compiled_memblocks = {}
+        self._compile_disabled_reason = None
+        self._compile_reported = False
         if self.fuse_tgrow:
             self._fuse_tgrow_layers(
                 operations, device=device, dtype=weight_dtype
@@ -479,9 +586,64 @@ class TCDecoder(ManagedComponent):
         else:
             self.mem[index] = self._clone_state(current)
 
-    def _run_sequential(self, input_frame):
+    def _call_memblock(self, block, current, past):
+        """Run an optional static-shape Inductor wrapper with eager fallback.
+
+        Keep compiled wrappers outside the registered module tree so ComfyUI's
+        CoreModelPatcher continues to own the original convolution parameters
+        and their Dynamic VRAM lifetime.
+        """
+        if not self.compile_memblocks or self._compile_disabled_reason:
+            return block(current, past)
+        compiler = getattr(torch, "compile", None)
+        if not callable(compiler):
+            self._compile_disabled_reason = "torch.compile is unavailable"
+            print(
+                "[FlashVSR] TCDecoder MemBlock compilation unavailable: "
+                f"{self._compile_disabled_reason}; using eager execution."
+            )
+            return block(current, past)
+        key = id(block)
+        compiled = self._compiled_memblocks.get(key)
+        if compiled is None:
+            try:
+                compiled = compiler(
+                    block,
+                    backend="inductor",
+                    dynamic=False,
+                    fullgraph=False,
+                )
+                self._compiled_memblocks[key] = compiled
+                if not self._compile_reported:
+                    print(
+                        "[FlashVSR] TCDecoder MemBlock torch.compile enabled; "
+                        "the first invocation of each static block may be "
+                        "slower while Inductor compiles it."
+                    )
+                    self._compile_reported = True
+            except Exception as error:
+                self._compile_disabled_reason = str(error)
+                self._compiled_memblocks.clear()
+                print(
+                    "[FlashVSR] TCDecoder MemBlock compilation setup failed: "
+                    f"{error}; using eager execution."
+                )
+                return block(current, past)
+        try:
+            return compiled(current, past)
+        except Exception as error:
+            self._compile_disabled_reason = str(error)
+            self._compiled_memblocks.clear()
+            print(
+                "[FlashVSR] TCDecoder compiled MemBlock failed: "
+                f"{error}; using eager execution for this and later blocks."
+            )
+            return block(current, past)
+
+    def _run_sequential(self, input_frame, profiler=None):
         """Depth-first execution with one high-resolution branch live."""
         pending = deque(((self._channels_last(input_frame), 0),))
+        base_height = input_frame.shape[-2]
 
         while pending:
             current, index = pending.popleft()
@@ -492,19 +654,31 @@ class TCDecoder(ManagedComponent):
                 continue
 
             block = self.decoder[index]
+            stage_name = (
+                profiler.block_name(block, current, base_height)
+                if profiler is not None else None
+            )
+            marker = profiler.start() if profiler is not None else None
             if isinstance(block, MemBlock):
                 stored = self.mem[index]
                 past = torch.zeros_like(current) if stored is None else stored
-                updated = block(current, past)
+                updated = self._call_memblock(block, current, past)
+                if profiler is not None:
+                    profiler.end(stage_name, marker)
                 # Fused TGrow emits views into one multi-frame allocation.
                 # Copy those views into a compact state instead of pinning all
                 # sibling branches; transfer ownership for ordinary outputs.
+                state_marker = profiler.start() if profiler is not None else None
                 self._retain_state(index, current)
+                if profiler is not None:
+                    profiler.end("tc_state_update", state_marker)
                 pending.appendleft((self._channels_last(updated), index + 1))
                 del current, past, stored, updated
                 continue
 
             current = self._channels_last(block(current))
+            if profiler is not None:
+                profiler.end(stage_name, marker)
             if isinstance(block, (TGrow, FusedTGrowConv)):
                 n, channels, height, width = current.shape
                 stride = block.stride
@@ -519,14 +693,20 @@ class TCDecoder(ManagedComponent):
             else:
                 pending.appendleft((current, index + 1))
 
-    def _run_temporal_batch(self, inputs):
+    def _run_temporal_batch(self, inputs, profiler=None):
         """Execute a bounded NTCHW group while preserving causal MemBlocks."""
         n, temporal, channels, height, width = inputs.shape
         current = self._channels_last(
             inputs.reshape(n * temporal, channels, height, width)
         )
+        base_height = height
 
         for index, block in enumerate(self.decoder):
+            stage_name = (
+                profiler.block_name(block, current, base_height)
+                if profiler is not None else None
+            )
+            marker = profiler.start() if profiler is not None else None
             if isinstance(block, MemBlock):
                 _, channels, height, width = current.shape
                 current_nt = current.reshape(
@@ -538,8 +718,13 @@ class TCDecoder(ManagedComponent):
                         past = torch.zeros_like(current)
                     else:
                         past = stored
-                    updated = block(current, past)
+                    updated = self._call_memblock(block, current, past)
+                    if profiler is not None:
+                        profiler.end(stage_name, marker)
+                    state_marker = profiler.start() if profiler is not None else None
                     self._retain_state(index, current)
+                    if profiler is not None:
+                        profiler.end("tc_state_update", state_marker)
                 else:
                     past = torch.empty_like(current)
                     past_nt = past.reshape(
@@ -550,16 +735,25 @@ class TCDecoder(ManagedComponent):
                     else:
                         past_nt[:, 0].copy_(stored)
                     past_nt[:, 1:].copy_(current_nt[:, :-1])
-                    updated = block(current, past)
+                    updated = self._call_memblock(block, current, past)
+                    if profiler is not None:
+                        profiler.end(stage_name, marker)
                     # A view of the last item would retain the complete batch.
                     # Clone only this one bounded state at batch boundaries.
+                    state_marker = (
+                        profiler.start() if profiler is not None else None
+                    )
                     self.mem[index] = self._clone_state(current_nt[:, -1])
+                    if profiler is not None:
+                        profiler.end("tc_state_update", state_marker)
                 current = self._channels_last(updated)
                 del updated, past, stored
                 continue
 
             current = block(current)
             current = self._channels_last(current)
+            if profiler is not None:
+                profiler.end(stage_name, marker)
             if isinstance(block, (TGrow, FusedTGrowConv)):
                 temporal *= block.stride
 
@@ -630,6 +824,7 @@ class TCDecoder(ManagedComponent):
         output_height=None,
         output_width=None,
         clamp_output=False,
+        profile_cuda_events=False,
     ):
         if latents_bcthw.ndim != 5 or condition_bcfhw.ndim != 5:
             raise ValueError(
@@ -688,6 +883,10 @@ class TCDecoder(ManagedComponent):
         temporal_batch_size = max(
             1, min(int(temporal_batch_size), timesteps)
         )
+        profiler = _TCDecoderProfiler(
+            profile_cuda_events, compute_device, temporal_batch_size
+        )
+        total_marker = profiler.start()
         produced_frames = 0
         raw_start = (self.frames_to_trim if trim else 0) + max(
             0, int(frame_start)
@@ -703,9 +902,11 @@ class TCDecoder(ManagedComponent):
             nonlocal selected_index, staged_count
             if staged_count == 0:
                 return
+            marker = profiler.start()
             selected_output[
                 :, selected_index:selected_index + staged_count
             ].copy_(staged_output[:, :staged_count])
+            profiler.end("tc_output_copy", marker)
             selected_index += staged_count
             staged_count = 0
 
@@ -742,17 +943,21 @@ class TCDecoder(ManagedComponent):
                     condition_clip = condition_bcfhw[
                         :, :, clip_start:clip_start + 4
                     ]
-                condition_t = self.pixel_shuffle(
-                    condition_clip.to(
-                        device=compute_device, dtype=compute_dtype
-                    )
+                marker = profiler.start()
+                condition_gpu = condition_clip.to(
+                    device=compute_device, dtype=compute_dtype
                 )
+                profiler.end("tc_condition_transfer", marker)
+                marker = profiler.start()
+                condition_t = self.pixel_shuffle(condition_gpu)
+                profiler.end("tc_pixel_unshuffle", marker)
                 if condition_t.shape[2] != 1:
                     raise RuntimeError(
                         "TCDecoder conditioning chunk did not produce "
                         "exactly one latent timestep."
                     )
                 current_input = input_buffer[:, offset]
+                marker = profiler.start()
                 current_input[:, :condition_channels].copy_(
                     condition_t[:, :, 0]
                 )
@@ -767,14 +972,17 @@ class TCDecoder(ManagedComponent):
                     latent_input.sub_(normalized_mean).mul_(
                         normalized_scale
                     )
-                del condition_t, current_input, latent_input
+                profiler.end("tc_latent_pack_normalize", marker)
+                del condition_gpu, condition_t, current_input, latent_input
 
             if temporal_batch_size == 1:
                 decoded = None
-                decoded_frames = self._run_sequential(input_buffer[:, 0])
+                decoded_frames = self._run_sequential(
+                    input_buffer[:, 0], profiler
+                )
             else:
                 decoded = self._run_temporal_batch(
-                    input_buffer[:, :batch_count]
+                    input_buffer[:, :batch_count], profiler
                 )
                 decoded_frames = (
                     decoded[:, output_index]
@@ -785,12 +993,14 @@ class TCDecoder(ManagedComponent):
                     output.append(current)
                 elif raw_start <= produced_frames < raw_stop:
                     frame = current
+                    marker = profiler.start()
                     if output_height is not None:
                         frame = frame[:, :, :int(output_height)]
                     if output_width is not None:
                         frame = frame[:, :, :, :int(output_width)]
                     if clamp_output:
                         frame.clamp_(0.0, 1.0)
+                    profiler.end("tc_crop_clamp", marker)
                     target_device = (
                         frame.device
                         if output_device is None
@@ -827,7 +1037,9 @@ class TCDecoder(ManagedComponent):
                             device=frame.device,
                             dtype=frame.dtype,
                         )
+                    marker = profiler.start()
                     staged_output[:, staged_count].copy_(frame)
+                    profiler.end("tc_output_staging", marker)
                     staged_count += 1
                     if staged_count == staged_output.shape[1]:
                         flush_staged_output()
@@ -847,9 +1059,14 @@ class TCDecoder(ManagedComponent):
                     "TCDecoder produced an incomplete selected frame range: "
                     f"{selected_index} of {frame_count} frames."
                 )
+            profiler.end("tc_decode_cuda_total", total_marker)
+            profiler.finish(timesteps, selected_index)
             return selected_output
         frames = torch.stack(output, dim=1)
-        return frames[:, self.frames_to_trim:] if trim else frames
+        result = frames[:, self.frames_to_trim:] if trim else frames
+        profiler.end("tc_decode_cuda_total", total_marker)
+        profiler.finish(timesteps, result.shape[1])
+        return result
 
 
 def _load_managed(
@@ -930,6 +1147,7 @@ def load_tcdecoder(
     dtype_name: str = "auto",
     fuse_tgrow: bool = False,
     channels_last: bool = False,
+    compile_memblocks: bool = False,
 ) -> ComponentHandle:
     return _load_managed(
         path,
@@ -939,5 +1157,6 @@ def load_tcdecoder(
         component_kwargs={
             "fuse_tgrow": bool(fuse_tgrow),
             "channels_last": bool(channels_last),
+            "compile_memblocks": bool(compile_memblocks),
         },
     )

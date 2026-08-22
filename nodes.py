@@ -14,7 +14,7 @@ from .model_paths import component_filenames, full_path
 from .runtime import FlashVSRRuntime, patch_model, prepare_video
 from .sampler import (
     CACHE_FORMATS,
-    CACHE_VRAM_POLICIES,
+    CACHE_RESIDENCY_BACKENDS,
     QKV_PROJECTION_MODES,
     SAMPLING_MODES,
     make_sampler,
@@ -126,6 +126,17 @@ class FlashVSRTCDecoderLoader:
                     "disabled for the low-VRAM baseline."
                 ),
             }),
+            "compile_memblocks": ("BOOLEAN", {
+                "default": False,
+                "advanced": True,
+                "tooltip": (
+                    "Experimental: use torch.compile/Inductor only around "
+                    "TCDecoder MemBlocks. The first run is slower and each "
+                    "static block shape may compile separately. Failures "
+                    "automatically return to eager execution. Leave disabled "
+                    "for the compatible Dynamic VRAM baseline."
+                ),
+            }),
         }}
 
     RETURN_TYPES = ("FLASHVSR_DECODER",)
@@ -133,13 +144,14 @@ class FlashVSRTCDecoderLoader:
     CATEGORY = "FlashVSR/loaders"
 
     def load(self, decoder_name, compute_dtype, fuse_tgrow=False,
-             channels_last=False):
+             channels_last=False, compile_memblocks=False):
         return (
             load_tcdecoder(
                 full_path(decoder_name),
                 compute_dtype,
                 fuse_tgrow=fuse_tgrow,
                 channels_last=channels_last,
+                compile_memblocks=compile_memblocks,
             ),
         )
 
@@ -342,16 +354,20 @@ class FlashVSRStreamingSampler:
                 "tooltip": (
                     "Print synchronized CUDA-event timings after sampling "
                     "for LQ transfers, pixel unshuffle, Conv3d, norm/SiLU, "
-                    "cache updates and linear projection; shared ConvRot "
+                    "cache updates and linear projection; asynchronous cache "
+                    "write enqueue/D2H/waits; shared ConvRot "
                     "quantization, Q/K/V GEMMs, Q/K norm/RoPE; complete Wan "
-                    "calls; LCSA routing; Sparge layout/mask/kernel/restore; "
-                    "and result assembly. It also prints LQ weight residency "
+                    "calls; compact-cache transfer, K-summary build/transfer, "
+                    "direct HND dequantization, current HND layout, and native "
+                    "Sparge block-INT8 K/transposed-FP8 V preparation; LCSA "
+                    "routing; Sparge input cast, "
+                    "K smoothing, Q/K quantization, LUT creation, V transpose/"
+                    "FP8 quantization, CUDA attention, and restore; and result "
+                    "assembly. It also prints LQ weight residency "
                     "and verifies BasicGuider/CFG=1 pass count. Off adds no "
                     "CUDA events; on is intended for benchmarking."
                 ),
             }),
-            # Keep new controls after the two legacy optional widgets so old
-            # workflow JSON retains its positional widget values.
             "qkv_projection": (QKV_PROJECTION_MODES, {
                 "default": "stock",
                 "advanced": True,
@@ -369,34 +385,26 @@ class FlashVSRStreamingSampler:
                 "tooltip": (
                     "Faithful modes only. int8 stores post-RoPE K and V as "
                     "independent per-token/per-head INT8 carriers (smallest). "
+                    "With FlashVSR Sparge Attention, v0.33 routes from cached "
+                    "K summaries and expands carriers directly into final HND "
+                    "layout, avoiding full FP16 staging tensors. "
                     "hybrid keeps K in model precision and stores V as INT8 "
                     "to protect attention scores. float keeps both in model "
                     "precision (largest). This is independent of QKV "
                     "projection and checkpoint dtype."
                 ),
             }),
-            "cache_vram_policy": (CACHE_VRAM_POLICIES, {
-                "default": "conservative",
+            "cache_residency_backend": (CACHE_RESIDENCY_BACKENDS, {
+                "default": "cpu",
                 "advanced": True,
                 "tooltip": (
-                    "Faithful modes only. Keeps complete per-block caches on "
-                    "GPU up to a bounded budget and the remainder on CPU. "
-                    "cpu uses no persistent cache VRAM; conservative, "
-                    "balanced, and aggressive use up to 25%, 50%, and 70% "
-                    "of currently free VRAM while retaining a safety reserve. "
-                    "custom uses cache_vram_budget_mb."
-                ),
-            }),
-            "cache_vram_budget_mb": ("INT", {
-                "default": 0,
-                "min": 0,
-                "max": 65536,
-                "step": 128,
-                "advanced": True,
-                "tooltip": (
-                    "Maximum cache VRAM in MiB when cache_vram_policy is "
-                    "custom. The allocator still preserves its safety "
-                    "reserve and falls individual blocks back to CPU."
+                    "Faithful modes only. cpu always stages the authoritative "
+                    "cache from system RAM and is the reliable fallback. "
+                    "aimdo_experimental keeps the same authoritative CPU "
+                    "cache while exposing a dedicated low-priority AIMDO "
+                    "VBAR as an evictable GPU mirror. Resident pages avoid "
+                    "CPU transfers; evicted, stale, or unavailable pages are "
+                    "repopulated from CPU per access. Requires ComfyUI AIMDO."
                 ),
             }),
         }}
@@ -408,8 +416,7 @@ class FlashVSRStreamingSampler:
     def build(self, runtime, sampling_mode, sparse_ratio, local_range,
               query_block_chunk, new_latent_frames=2,
               profile_cuda_events=False, qkv_projection="stock",
-              cache_format="int8", cache_vram_policy="conservative",
-              cache_vram_budget_mb=0):
+              cache_format="int8", cache_residency_backend="cpu"):
         return (
             make_sampler(
                 runtime=runtime,
@@ -421,8 +428,7 @@ class FlashVSRStreamingSampler:
                 profile_cuda_events=profile_cuda_events,
                 qkv_projection=qkv_projection,
                 cache_format=cache_format,
-                cache_vram_policy=cache_vram_policy,
-                cache_vram_budget_mb=cache_vram_budget_mb,
+                cache_residency_backend=cache_residency_backend,
             ),
             torch.tensor([1.0, 0.0], dtype=torch.float32),
         )
@@ -474,6 +480,18 @@ class FlashVSRTCDecode:
                         "the complete clip duration."
                     ),
                 }),
+                "profile_cuda_events": ("BOOLEAN", {
+                    "default": False,
+                    "advanced": True,
+                    "tooltip": (
+                        "Print TCDecoder CUDA-event timings grouped by "
+                        "resolution for conditioning transfer, pixel "
+                        "unshuffle, convolutions, MemBlocks, TGrow, state "
+                        "updates, crop/clamp and output copies, plus wall "
+                        "time and peak allocated/reserved VRAM. Profiling "
+                        "adds a final CUDA synchronization."
+                    ),
+                }),
             },
         }
 
@@ -482,7 +500,7 @@ class FlashVSRTCDecode:
     CATEGORY = "FlashVSR/decoding"
 
     def decode(self, samples, decoder, video, output_chunk_size=4,
-               temporal_batch_size=1):
+               temporal_batch_size=1, profile_cuda_events=False):
         model_management.load_models_gpu([decoder.patcher])
         device = decoder.patcher.load_device
         dtype = decoder.compute_dtype
@@ -511,6 +529,7 @@ class FlashVSRTCDecode:
                 output_height=video.output_height,
                 output_width=video.output_width,
                 clamp_output=True,
+                profile_cuda_events=profile_cuda_events,
             )
             images = frames[0].movedim(1, -1)
             return (images,)
@@ -573,6 +592,34 @@ class FlashVSRCropFrames:
                     "also batches AdaIN when that mode is selected."
                 ),
             }),
+            "color_device": (["auto", "cuda", "cpu"], {
+                "default": "auto",
+                "advanced": True,
+                "tooltip": (
+                    "Device used by AdaIN/wavelet correction. auto uses a "
+                    "CUDA GPU when available and otherwise CPU. GPU work is "
+                    "bounded by color_chunk_size and uses FP16 workspaces."
+                ),
+            }),
+            "inplace_correction": ("BOOLEAN", {
+                "default": True,
+                "advanced": True,
+                "tooltip": (
+                    "Correct the decoder IMAGE tensor in bounded chunks "
+                    "instead of allocating a second complete video. Disable "
+                    "only when the uncorrected decoder output is also used "
+                    "by another workflow branch."
+                ),
+            }),
+            "profile_stages": ("BOOLEAN", {
+                "default": False,
+                "advanced": True,
+                "tooltip": (
+                    "Print wall time and per-stage color-correction timing "
+                    "for transfers, downsampling, lowpass, upsampling, "
+                    "clamping and output transfer."
+                ),
+            }),
         }}
 
     RETURN_TYPES = ("IMAGE",)
@@ -580,7 +627,8 @@ class FlashVSRCropFrames:
     CATEGORY = "FlashVSR/decoding"
 
     def crop(self, images, video, color_correction="off",
-             color_chunk_size=4):
+             color_chunk_size=4, color_device="auto",
+             inplace_correction=True, profile_stages=False):
         images = images[video.crop_start:video.crop_start + video.original_frames]
         images = images[:, :video.output_height, :video.output_width]
         if color_correction != "off":
@@ -589,6 +637,9 @@ class FlashVSRCropFrames:
                 video,
                 method=color_correction,
                 chunk_size=color_chunk_size,
+                compute_device=color_device,
+                inplace=inplace_correction,
+                profile_stages=profile_stages,
             )
         return (images,)
 

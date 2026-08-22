@@ -8,9 +8,82 @@ from __future__ import annotations
 
 from functools import lru_cache
 import math
+import time
 
 import torch
 import torch.nn.functional as F
+
+
+class _ColorProfiler:
+    """Optional wall/CUDA-event profiler for bounded color correction."""
+
+    def __init__(self, enabled: bool, device: torch.device):
+        self.enabled = bool(enabled)
+        self.device = torch.device(device)
+        self.cuda = bool(
+            self.enabled
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+        self.wall_start = time.perf_counter()
+        self.events = {}
+        self.cpu = {}
+
+    def start(self):
+        if not self.enabled:
+            return None
+        if not self.cuda:
+            return time.perf_counter()
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(torch.cuda.current_stream(self.device))
+        return event
+
+    def end(self, name, marker):
+        if marker is None:
+            return
+        if self.cuda:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record(torch.cuda.current_stream(self.device))
+            self.events.setdefault(name, []).append((marker, event))
+        else:
+            elapsed = (time.perf_counter() - marker) * 1000.0
+            total, count = self.cpu.get(name, (0.0, 0))
+            self.cpu[name] = (total + elapsed, count + 1)
+
+    def finish(self, method, frames, chunk_size, inplace):
+        if not self.enabled:
+            return
+        if self.cuda:
+            torch.cuda.synchronize(self.device)
+            totals = {
+                name: (
+                    sum(start.elapsed_time(end) for start, end in records),
+                    len(records),
+                )
+                for name, records in self.events.items()
+            }
+        else:
+            totals = self.cpu
+        wall_ms = (time.perf_counter() - self.wall_start) * 1000.0
+        print(
+            "[FlashVSR Postprocess profiler] "
+            f"method={method}, device={self.device}, frames={frames}, "
+            f"chunk_size={chunk_size}, inplace={bool(inplace)}."
+        )
+        print(
+            f"[FlashVSR Postprocess profiler]   wall_total: {wall_ms:.2f} ms"
+        )
+        for name in (
+            "input_transfer", "downsample", "lowpass", "upsample_correct",
+            "adain", "clamp", "output_transfer",
+        ):
+            if name not in totals:
+                continue
+            total, count = totals[name]
+            print(
+                f"[FlashVSR Postprocess profiler]   {name}: {total:.2f} ms "
+                f"({count} calls, {total / count:.2f} ms/call)"
+            )
 
 
 @lru_cache(maxsize=16)
@@ -50,6 +123,7 @@ def wavelet_reconstruct(
     style: torch.Tensor,
     levels: int = 5,
     downsample: int = 4,
+    profiler=None,
 ) -> torch.Tensor:
     """Use generated detail and reference low-frequency color.
 
@@ -61,29 +135,52 @@ def wavelet_reconstruct(
     its low-frequency component is retained. ``downsample=1`` preserves the
     previous exact five-pass path.
     """
-    difference = style - content
     downsample = max(1, int(downsample))
-    if downsample > 1 and min(difference.shape[-2:]) > 1:
-        height, width = difference.shape[-2:]
+    if downsample > 1 and min(content.shape[-2:]) > 1:
+        height, width = content.shape[-2:]
         working_height = max(1, (height + downsample - 1) // downsample)
         working_width = max(1, (width + downsample - 1) // downsample)
-        difference = F.interpolate(
-            difference,
+        marker = profiler.start() if profiler is not None else None
+        # Area resampling is linear. Downsample first and subtract second so
+        # quarter-resolution mode never materializes a full-resolution
+        # style-content difference tensor.
+        content_small = F.interpolate(
+            content,
             size=(working_height, working_width),
             mode="area",
         )
+        style_small = F.interpolate(
+            style,
+            size=(working_height, working_width),
+            mode="area",
+        )
+        difference = style_small.sub(content_small)
+        if profiler is not None:
+            profiler.end("downsample", marker)
         removed_scales = max(0, int(round(math.log2(downsample))))
+        marker = profiler.start() if profiler is not None else None
         difference = _wavelet_lowpass(
             difference, max(1, int(levels) - removed_scales)
         )
-        difference = F.interpolate(
+        if profiler is not None:
+            profiler.end("lowpass", marker)
+        marker = profiler.start() if profiler is not None else None
+        correction = F.interpolate(
             difference,
             size=(height, width),
             mode="bilinear",
             align_corners=False,
         )
+        result = content + correction
+        if profiler is not None:
+            profiler.end("upsample_correct", marker)
+        return result
     else:
+        difference = style - content
+        marker = profiler.start() if profiler is not None else None
         difference = _wavelet_lowpass(difference, int(levels))
+        if profiler is not None:
+            profiler.end("lowpass", marker)
     return content + difference
 
 
@@ -111,8 +208,11 @@ def apply_color_correction(
     method: str,
     chunk_size: int = 4,
     levels: int = 5,
+    compute_device: str = "auto",
+    inplace: bool = True,
+    profile_stages: bool = False,
 ) -> torch.Tensor:
-    """Correct a cropped IMAGE batch without retaining every output chunk."""
+    """Correct a cropped IMAGE batch with bounded CPU/GPU workspaces."""
     if images.ndim != 4 or images.shape[-1] < 3:
         raise ValueError("Color correction expects IMAGE [F,H,W,C].")
     if method not in (
@@ -132,27 +232,44 @@ def apply_color_correction(
         )
 
     chunk_size = max(1, int(chunk_size))
-    output = torch.empty_like(images)
+    requested = str(compute_device).lower()
+    if requested not in ("auto", "cpu", "cuda"):
+        raise ValueError(f"Unknown color correction device: {compute_device}")
+    if requested == "cpu":
+        work_device = torch.device("cpu")
+    elif requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA postprocessing was requested but unavailable.")
+        work_device = torch.device("cuda", torch.cuda.current_device())
+    elif images.is_cuda:
+        work_device = images.device
+    elif torch.cuda.is_available():
+        work_device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        work_device = torch.device("cpu")
+
+    output = images if bool(inplace) else torch.empty_like(images)
+    profiler = _ColorProfiler(profile_stages, work_device)
     for offset in range(0, frame_count, chunk_size):
         end = min(offset + chunk_size, frame_count)
         content_chunk = images[offset:end, ..., :3]
         # Work in float32 because CPU float16 grouped convolution is not
         # consistently implemented across supported PyTorch versions.
         work_dtype = (
-            content_chunk.dtype
-            if content_chunk.is_cuda and content_chunk.dtype in (
-                torch.float16, torch.bfloat16, torch.float32
-            )
-            else torch.float32
+            torch.float16 if work_device.type == "cuda" else torch.float32
         )
-        content_nchw = content_chunk.movedim(-1, 1).to(dtype=work_dtype)
+        marker = profiler.start()
+        content_nchw = content_chunk.movedim(-1, 1).to(
+            device=work_device, dtype=work_dtype
+        )
         style_nchw = (
             style[offset:end, ..., :3]
             .movedim(-1, 1)
-            .to(device=content_nchw.device, dtype=work_dtype)
+            .to(device=work_device, dtype=work_dtype)
             .add(1.0)
             .mul(0.5)
         )
+        profiler.end("input_transfer", marker)
         if method.startswith("wavelet_"):
             corrected = wavelet_reconstruct(
                 content_nchw,
@@ -161,12 +278,23 @@ def apply_color_correction(
                 downsample=(
                     4 if method == "wavelet_quarter_res" else 1
                 ),
+                profiler=profiler,
             )
         else:
+            marker = profiler.start()
             corrected = adain_reconstruct(content_nchw, style_nchw)
+            profiler.end("adain", marker)
+        marker = profiler.start()
         corrected.clamp_(0.0, 1.0)
-        corrected = corrected.movedim(1, -1).to(dtype=images.dtype)
+        profiler.end("clamp", marker)
+        marker = profiler.start()
+        corrected = corrected.movedim(1, -1).to(
+            device=output.device, dtype=images.dtype
+        )
         output[offset:end, ..., :3].copy_(corrected)
         if images.shape[-1] > 3:
             output[offset:end, ..., 3:].copy_(images[offset:end, ..., 3:])
+        profiler.end("output_transfer", marker)
+        del content_nchw, style_nchw, corrected
+    profiler.finish(method, frame_count, chunk_size, inplace)
     return output

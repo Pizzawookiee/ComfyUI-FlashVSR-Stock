@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import math
 
@@ -8,6 +9,11 @@ import torch
 import comfy.ldm.modules.attention as comfy_attention
 
 from .components import ComponentHandle
+from .cache_writeback import AsyncCacheWriter
+from .aimdo_cache import (
+    AimdoCacheController,
+    is_aimdo_value,
+)
 from .qkv import Int8Carrier, carrier_nbytes, install_wan_qkv_patches
 from .sparse_backend import SPARSE_BACKEND_OPTION
 
@@ -30,6 +36,19 @@ class PreparedVideo:
     height: int
     output_width: int
     output_height: int
+
+
+@dataclass(frozen=True)
+class CompactKVDescriptor:
+    """Chronological compact cache plus the current floating-point K/V."""
+
+    slots: tuple
+    current_k: torch.Tensor
+    current_v: torch.Tensor
+    tokens_per_frame: int
+    history_frames: int
+    heads: int
+    k_reference_mean: torch.Tensor
 
 
 def prepare_video(images: torch.Tensor) -> PreparedVideo:
@@ -207,10 +226,8 @@ class FlashVSRKVCache:
         self.entries = {}
         self.pending_entries = {}
         self.cache_format = "int8"
-        self.vram_policy = "conservative"
-        self.custom_vram_mb = 0
-        self.block_storage_devices = {}
-        self.gpu_blocks = set()
+        self.residency_backend = "cpu"
+        self.aimdo_controller = None
         self.bytes_per_block = 0
         self.write_slot = 0
         self.initial_chunk = False
@@ -219,27 +236,27 @@ class FlashVSRKVCache:
         self.stage_v = None
         self.total_cache_bytes = 0
         self.reported = False
+        self.k_reference_means = {}
+        self.async_writer = None
 
     @property
     def enabled(self):
         return bool(self.active_blocks)
 
     def configure(self, mode, total_blocks, cache_format="int8",
-                  vram_policy="conservative", custom_vram_mb=0):
+                  residency_backend="cpu"):
         self.clear()
         self.mode = mode
         self.cache_format = str(cache_format)
-        self.vram_policy = str(vram_policy)
-        self.custom_vram_mb = max(0, int(custom_vram_mb or 0))
+        self.residency_backend = str(residency_backend)
         if self.cache_format not in ("int8", "hybrid", "float"):
             raise ValueError(
                 f"Unknown FlashVSR faithful cache format: {self.cache_format}"
             )
-        if self.vram_policy not in (
-            "cpu", "conservative", "balanced", "aggressive", "custom"
-        ):
+        if self.residency_backend not in ("cpu", "aimdo_experimental"):
             raise ValueError(
-                f"Unknown FlashVSR cache VRAM policy: {self.vram_policy}"
+                "Unknown FlashVSR cache residency backend: "
+                f"{self.residency_backend}"
             )
         self.total_blocks = max(0, int(total_blocks or 0))
         if mode == "streaming_faithful_full":
@@ -281,11 +298,28 @@ class FlashVSRKVCache:
                 "FlashVSR did not update every configured KV-cache block "
                 f"during this model call. Missing block indices: {preview}."
             )
+        # CPU cache placeholders returned by the bounded asynchronous writer
+        # must be complete before they become authoritative. Most transfers
+        # have already overlapped later Wan blocks by this point.
+        if self.async_writer is not None:
+            self.async_writer.flush()
         if self.initial_chunk:
             self.entries = self.pending_entries
         else:
             for block_index, pending in self.pending_entries.items():
-                self.entries[block_index][self.write_slot] = pending
+                committed = []
+                for value in pending:
+                    if (
+                        isinstance(value, tuple)
+                        and len(value) == 2
+                        and is_aimdo_value(value[0])
+                    ):
+                        wrapper, update = value
+                        wrapper.commit_update(update)
+                        committed.append(wrapper)
+                    else:
+                        committed.append(value)
+                self.entries[block_index][self.write_slot] = tuple(committed)
         if not self.initial_chunk:
             self.write_slot = (self.write_slot + 1) % self.slot_count
         self.pending_entries = {}
@@ -312,18 +346,100 @@ class FlashVSRKVCache:
             carrier.head_dim,
         )
 
-    def _cache_value(self, source, device, value_kind, heads):
+    def _make_gpu_value(self, source, value_kind, heads):
         compact = (
             self.cache_format == "int8"
             or (self.cache_format == "hybrid" and value_kind == "v")
         )
         if compact:
-            return Int8Carrier.from_tensor(source, device, heads)
-        return self._allocate_copy(source, device)
+            return Int8Carrier.from_tensor(
+                source, source.device, heads
+            )
+        return source.detach()
+
+    def _make_cache_value(self, source, value_kind, heads):
+        gpu_value = self._make_gpu_value(source, value_kind, heads)
+        return self._carrier_to(
+            gpu_value, torch.device("cpu")
+        ), gpu_value
+
+    def _store_new_value(self, source, value_kind, heads):
+        cpu_value, gpu_value = self._make_cache_value(
+            source, value_kind, heads
+        )
+        if self.aimdo_controller is not None:
+            return self.aimdo_controller.wrap(cpu_value, gpu_value)
+        return cpu_value
+
+    def _make_k_summary(self, source, heads, tokens_per_frame):
+        """Pool live K while its FP tensor is already available at commit.
+
+        v0.34 reconstructed summaries from the newly quantized carrier. That
+        reread INT8 data and row scales immediately after quantization. The
+        summary is routing metadata, so compute it directly from the same live
+        K projection before the compact CPU write-through begins.
+        """
+        if not torch.is_tensor(source) or source.ndim != 3:
+            raise TypeError("Compact LCSA summaries require a BNC K tensor.")
+        batch, tokens, channels = source.shape
+        head_dim = channels // heads
+        height = self.runtime.video.height // 16
+        width = self.runtime.video.width // 16
+        if tokens != self.SLOT_FRAMES * tokens_per_frame:
+            raise RuntimeError("Unexpected compact K slot length.")
+        summary_marker = self.runtime.profile_start(source)
+        block_indices, _ = self.runtime._lcsa_token_indices(
+            self.SLOT_FRAMES, height, width, source.device
+        )
+        block_count = tokens // 128
+        pooled = torch.empty(
+            (batch, heads, block_count, head_dim),
+            device=source.device,
+            dtype=source.dtype,
+        )
+        values_hnd = source.view(batch, tokens, heads, head_dim).permute(
+            0, 2, 1, 3
+        )
+        # Keep index-select work bounded at high resolutions.
+        blocks_per_chunk = 128
+        for start in range(0, block_count, blocks_per_chunk):
+            end = min(start + blocks_per_chunk, block_count)
+            indices = block_indices[start * 128:end * 128]
+            pooled[:, :, start:end].copy_(
+                values_hnd.index_select(2, indices)
+                .view(batch, heads, end - start, 128, head_dim)
+                .mean(3)
+            )
+        # One slot is one logical temporal block. Store the tiny summary on
+        # CPU; unlike K itself it is copied once per layer, not per token.
+        summary = pooled.permute(0, 2, 1, 3).unsqueeze(1).to(
+            device="cpu", non_blocking=False
+        ).contiguous()
+        self.runtime.profile_end("kv_k_summary_build_d2h", summary_marker)
+        return summary
+
+    def _store_new_slot(self, k, v, heads, tokens_per_frame):
+        gpu_k = self._make_gpu_value(k, "k", heads)
+        gpu_v = self._make_gpu_value(v, "v", heads)
+        if self.async_writer is not None and self.cache_format == "int8":
+            cpu_k, cpu_v = self.async_writer.submit_pair(gpu_k, gpu_v)
+        else:
+            cpu_k = self._carrier_to(gpu_k, torch.device("cpu"))
+            cpu_v = self._carrier_to(gpu_v, torch.device("cpu"))
+        summary = (
+            self._make_k_summary(k, heads, tokens_per_frame)
+            if self.cache_format == "int8" else None
+        )
+        if self.aimdo_controller is not None:
+            cpu_k = self.aimdo_controller.wrap(cpu_k, gpu_k)
+            cpu_v = self.aimdo_controller.wrap(cpu_v, gpu_v)
+        return cpu_k, cpu_v, summary
 
     @staticmethod
     def _copy_cached_to(cached, destination):
-        if isinstance(cached, Int8Carrier):
+        if is_aimdo_value(cached):
+            cached.copy_to(destination)
+        elif isinstance(cached, Int8Carrier):
             cached.copy_to(destination)
         else:
             destination.copy_(cached, non_blocking=False)
@@ -337,7 +453,7 @@ class FlashVSRKVCache:
             return float_bytes + int8_bytes
         return float_bytes * 2
 
-    def _choose_storage_plan(self, k, slot_tokens, heads):
+    def _initialize_storage(self, k, slot_tokens, heads):
         slot_shape = (k.shape[0], slot_tokens, k.shape[2])
         bytes_per_slot = self._slot_bytes(
             slot_shape, heads, k.element_size()
@@ -346,115 +462,108 @@ class FlashVSRKVCache:
         self.total_cache_bytes = (
             self.bytes_per_block * len(self.active_blocks)
         )
-        free_bytes = None
-        budget = 0
-        if k.device.type == "cuda" and self.vram_policy != "cpu":
-            try:
-                free_bytes, total_bytes = torch.cuda.mem_get_info(k.device)
-                reserve = max(
-                    1536 * 1024 * 1024,
-                    int(total_bytes * 0.20),
-                )
-                available = max(0, free_bytes - reserve)
-                fractions = {
-                    "conservative": 0.25,
-                    "balanced": 0.50,
-                    "aggressive": 0.70,
-                }
-                if self.vram_policy == "custom":
-                    requested = self.custom_vram_mb * 1024 * 1024
-                else:
-                    requested = int(
-                        free_bytes * fractions[self.vram_policy]
-                    )
-                budget = min(available, requested)
-            except (RuntimeError, TypeError):
-                budget = 0
-        gpu_count = min(
-            len(self.active_blocks),
-            budget // max(1, self.bytes_per_block),
-        )
-        # Keep complete per-layer histories together. Partial layer slots
-        # complicate failure recovery and do not help the attention API.
-        self.gpu_blocks = set(sorted(self.active_blocks)[:gpu_count])
-        self.block_storage_devices = {
-            block: (k.device if block in self.gpu_blocks else torch.device("cpu"))
-            for block in self.active_blocks
-        }
+        if self.cache_format == "int8" and k.device.type == "cuda":
+            self.async_writer = AsyncCacheWriter(
+                self.runtime, k.device, depth=2
+            )
+            if not self.async_writer.enabled:
+                self.async_writer.report()
+        if self.residency_backend == "aimdo_experimental":
+            compact_components = 2
+            k_components = (
+                compact_components if self.cache_format == "int8" else 1
+            )
+            v_components = (
+                compact_components
+                if self.cache_format in ("int8", "hybrid") else 1
+            )
+            allocation_count = (
+                len(self.active_blocks) * self.slot_count
+                * (k_components + v_components)
+            )
+            controller = AimdoCacheController(
+                self.total_cache_bytes, allocation_count, k.device,
+                runtime=self.runtime,
+            )
+            if controller.enabled:
+                self.aimdo_controller = controller
+            else:
+                controller.report()
+                self.aimdo_controller = None
         if not self.reported:
             first = min(self.active_blocks)
             last = max(self.active_blocks)
-            free_text = (
-                f", free VRAM={free_bytes / (1024 ** 2):.0f} MiB"
-                if free_bytes is not None else ""
+            actual = (
+                "aimdo_experimental"
+                if self.aimdo_controller is not None else "cpu"
             )
             print(
                 "[FlashVSR] faithful KV cache: blocks "
                 f"{first}-{last}, history={self.history_frames} frames, "
-                f"format={self.cache_format}, policy={self.vram_policy}, "
-                f"GPU-resident={len(self.gpu_blocks)}/{len(self.active_blocks)}, "
-                f"estimated={self.total_cache_bytes / (1024 ** 3):.2f} GiB"
-                f"{free_text}."
+                f"format={self.cache_format}, residency={actual}, "
+                f"CPU-authoritative={self.total_cache_bytes / (1024 ** 3):.2f} GiB."
             )
-            cpu_blocks = len(self.active_blocks) - len(self.gpu_blocks)
-            if cpu_blocks:
-                cpu_bytes = self.bytes_per_block * cpu_blocks
-                print(
-                    "[FlashVSR] faithful KV cache transfer per "
-                    "continuation: approximately "
-                    f"{cpu_bytes / (1024 ** 3):.2f} GiB "
-                    "CPU->GPU and "
-                    f"{cpu_bytes / self.slot_count / (1024 ** 3):.2f} GiB "
-                    "GPU->CPU."
-                )
+            print(
+                "[FlashVSR] faithful KV cache maximum CPU fallback per "
+                "continuation: approximately "
+                f"{self.total_cache_bytes / (1024 ** 3):.2f} GiB "
+                "CPU->GPU and "
+                f"{self.total_cache_bytes / self.slot_count / (1024 ** 3):.2f} GiB "
+                "GPU->CPU. AIMDO resident hits reduce CPU->GPU traffic."
+            )
             self.reported = True
 
-    def _copy_initial_slots(self, block_index, k, v, slot_tokens, heads):
+    def _copy_initial_slots(self, block_index, k, v, slot_tokens, heads,
+                            tokens_per_frame):
         slots = []
         # Full mode retains all six prefill frames. Low-VRAM mode must retain
         # the nearest two prefill frames, so start at the tail of the input.
         history_tokens = self.history_frames * (slot_tokens // self.SLOT_FRAMES)
         history_start = k.shape[1] - history_tokens
-        device = self.block_storage_devices[int(block_index)]
         for slot_index in range(self.slot_count):
             start = history_start + slot_index * slot_tokens
             end = start + slot_tokens
-            slots.append((
-                self._cache_value(k[:, start:end], device, "k", heads),
-                self._cache_value(v[:, start:end], device, "v", heads),
+            slots.append(self._store_new_slot(
+                k[:, start:end], v[:, start:end], heads, tokens_per_frame
             ))
         return slots
 
-    def _migrate_block_to_cpu(self, block_index):
-        block_index = int(block_index)
-        if block_index in self.entries:
-            self.entries[block_index] = [
-                (self._carrier_to(a, "cpu"), self._carrier_to(b, "cpu"))
-                for a, b in self.entries[block_index]
-            ]
-        if block_index in self.pending_entries:
-            pending = self.pending_entries[block_index]
-            if self.initial_chunk:
-                pending = [
-                    (self._carrier_to(a, "cpu"), self._carrier_to(b, "cpu"))
-                    for a, b in pending
-                ]
-            else:
-                pending = (
-                    self._carrier_to(pending[0], "cpu"),
-                    self._carrier_to(pending[1], "cpu"),
-                )
-            self.pending_entries[block_index] = pending
-        self.block_storage_devices[block_index] = torch.device("cpu")
-        self.gpu_blocks.discard(block_index)
-        self.stage_k = None
-        self.stage_v = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print(
-            f"[FlashVSR] faithful KV cache block {block_index} fell back "
-            "to CPU after GPU allocation pressure."
+    def describe(self, block_index, k, v, tokens_per_frame, heads):
+        """Return compact chronological cache metadata without FP expansion."""
+        if self.initial_chunk or self.cache_format != "int8":
+            return None
+        slots = self.entries.get(int(block_index))
+        if slots is None:
+            raise RuntimeError(
+                f"FlashVSR KV cache for Wan block {block_index} was not "
+                "initialized by the first six-frame model call."
+            )
+        chronological = tuple(
+            slots[(self.write_slot + relative) % self.slot_count]
+            for relative in range(self.slot_count)
         )
+        if any(len(slot) != 3 or slot[2] is None for slot in chronological):
+            return None
+        return CompactKVDescriptor(
+            chronological, k, v, tokens_per_frame,
+            self.history_frames, heads,
+            self.k_reference_means[int(block_index)],
+        )
+
+    @contextmanager
+    def acquire_compact_slots(self, descriptor, device):
+        """Pin/acquire every compact slot for one native Sparge launch."""
+        with ExitStack() as stack:
+            acquired = []
+            for cached_k, cached_v, _summary in descriptor.slots:
+                compact_k = stack.enter_context(
+                    self._acquire_compact(cached_k, device)
+                )
+                compact_v = stack.enter_context(
+                    self._acquire_compact(cached_v, device)
+                )
+                acquired.append((compact_k, compact_v))
+            yield tuple(acquired)
 
     def stage(self, block_index, k, v, tokens_per_frame):
         """Return chronological cached+current K/V for a continuation."""
@@ -484,7 +593,7 @@ class FlashVSRKVCache:
         offset = 0
         for relative in range(self.slot_count):
             slot_index = (self.write_slot + relative) % self.slot_count
-            cached_k, cached_v = slots[slot_index]
+            cached_k, cached_v = slots[slot_index][:2]
             end = offset + current_tokens
             self._copy_cached_to(
                 cached_k, self.stage_k[:, offset:end]
@@ -497,6 +606,153 @@ class FlashVSRKVCache:
         self.stage_v[:, history_tokens:].copy_(v, non_blocking=False)
         return self.stage_k, self.stage_v
 
+    @contextmanager
+    def _acquire_compact(self, cached, device):
+        if is_aimdo_value(cached):
+            with cached.acquire_compact(device) as value:
+                yield value
+            return
+        if not isinstance(cached, Int8Carrier):
+            raise TypeError(
+                "Direct FlashVSR HND materialization requires an INT8 cache."
+            )
+        value = self._carrier_to(cached, device)
+        try:
+            yield value
+        finally:
+            del value
+
+    @staticmethod
+    def _dequantize_hnd(carrier, destination, block_indices):
+        if not isinstance(carrier, Int8Carrier):
+            raise TypeError("Expected a compact INT8 cache carrier.")
+        batch, tokens, channels = carrier.shape
+        heads = destination.shape[1]
+        head_dim = channels // heads
+        if destination.shape != (batch, heads, tokens, head_dim):
+            raise RuntimeError("Compact cache HND destination shape mismatch.")
+        qdata = carrier.qdata.view(batch, tokens, heads, head_dim).permute(
+            0, 2, 1, 3
+        )
+        scale = carrier.scale.view(batch, tokens, heads, 1).permute(
+            0, 2, 1, 3
+        )
+        # Bound index-select work while writing directly into the final HND
+        # allocation consumed by SpargeAttn.
+        tokens_per_chunk = 4096
+        for start in range(0, tokens, tokens_per_chunk):
+            end = min(start + tokens_per_chunk, tokens)
+            indices = block_indices[start:end]
+            target = destination[:, :, start:end]
+            target.copy_(qdata.index_select(2, indices))
+            target.mul_(
+                scale.index_select(2, indices).to(dtype=destination.dtype)
+            )
+
+    def materialize_hnd(self, descriptor, block_indices, profiler=None):
+        """Expand compact slots once, directly into final Sparge HND layout."""
+        current_k = descriptor.current_k
+        current_v = descriptor.current_v
+        batch, current_tokens, channels = current_k.shape
+        heads = descriptor.heads
+        head_dim = channels // heads
+        slot_tokens = self.SLOT_FRAMES * descriptor.tokens_per_frame
+        history_tokens = descriptor.history_frames * descriptor.tokens_per_frame
+        total_tokens = history_tokens + current_tokens
+        k_hnd = torch.empty(
+            (batch, heads, total_tokens, head_dim),
+            device=current_k.device,
+            dtype=current_k.dtype,
+        )
+        v_hnd = torch.empty_like(k_hnd)
+
+        offset = 0
+        for cached_k, cached_v, _summary in descriptor.slots:
+            end = offset + slot_tokens
+            for cached, destination in (
+                (cached_k, k_hnd[:, :, offset:end]),
+                (cached_v, v_hnd[:, :, offset:end]),
+            ):
+                transfer_marker = (
+                    profiler.profile_start(current_k)
+                    if profiler is not None else None
+                )
+                with self._acquire_compact(cached, current_k.device) as carrier:
+                    if profiler is not None:
+                        profiler.profile_end(
+                            "kv_cache_compact_h2d", transfer_marker
+                        )
+                    dequant_marker = (
+                        profiler.profile_start(current_k)
+                        if profiler is not None else None
+                    )
+                    self._dequantize_hnd(
+                        carrier, destination, block_indices
+                    )
+                    if profiler is not None:
+                        profiler.profile_end(
+                            "kv_cache_dequant_hnd", dequant_marker
+                        )
+            offset = end
+
+        current_marker = (
+            profiler.profile_start(current_k)
+            if profiler is not None else None
+        )
+        for source, destination in (
+            (current_k, k_hnd[:, :, history_tokens:]),
+            (current_v, v_hnd[:, :, history_tokens:]),
+        ):
+            destination.copy_(
+                source.view(batch, current_tokens, heads, head_dim)
+                .permute(0, 2, 1, 3)
+                .index_select(2, block_indices)
+            )
+        if profiler is not None:
+            profiler.profile_end("kv_current_hnd", current_marker)
+        return k_hnd, v_hnd
+
+    def materialize_v_hnd(self, descriptor, block_indices, profiler=None):
+        """Materialize only FP16/BF16 V for Sparge's Ampere ABI."""
+        current = descriptor.current_v
+        batch, current_tokens, channels = current.shape
+        heads = descriptor.heads
+        head_dim = channels // heads
+        slot_tokens = self.SLOT_FRAMES * descriptor.tokens_per_frame
+        history_tokens = descriptor.history_frames * descriptor.tokens_per_frame
+        total_tokens = history_tokens + current_tokens
+        output = torch.empty(
+            (batch, heads, total_tokens, head_dim),
+            device=current.device, dtype=current.dtype,
+        )
+        offset = 0
+        for _cached_k, cached_v, _summary in descriptor.slots:
+            end = offset + slot_tokens
+            transfer_marker = (
+                profiler.profile_start(current) if profiler else None
+            )
+            with self._acquire_compact(cached_v, current.device) as carrier:
+                if profiler:
+                    profiler.profile_end(
+                        "kv_cache_compact_h2d", transfer_marker
+                    )
+                marker = profiler.profile_start(current) if profiler else None
+                self._dequantize_hnd(
+                    carrier, output[:, :, offset:end], block_indices
+                )
+                if profiler:
+                    profiler.profile_end("kv_cache_dequant_hnd", marker)
+            offset = end
+        marker = profiler.profile_start(current) if profiler else None
+        output[:, :, history_tokens:].copy_(
+            current.view(batch, current_tokens, heads, head_dim)
+            .permute(0, 2, 1, 3)
+            .index_select(2, block_indices)
+        )
+        if profiler:
+            profiler.profile_end("kv_current_hnd", marker)
+        return output
+
     def commit(self, block_index, k, v, tokens_per_frame, heads):
         block_index = int(block_index)
         if self.initial_chunk:
@@ -507,19 +763,21 @@ class FlashVSRKVCache:
                     "frames."
                 )
             slot_tokens = self.SLOT_FRAMES * tokens_per_frame
-            if not self.block_storage_devices:
-                self._choose_storage_plan(k, slot_tokens, heads)
-            try:
-                pending = self._copy_initial_slots(
-                    block_index, k, v, slot_tokens, heads
-                )
-            except RuntimeError:
-                if self.block_storage_devices[block_index].type != "cuda":
-                    raise
-                self._migrate_block_to_cpu(block_index)
-                pending = self._copy_initial_slots(
-                    block_index, k, v, slot_tokens, heads
-                )
+            if self.total_cache_bytes == 0:
+                self._initialize_storage(k, slot_tokens, heads)
+            batch, _tokens, channels = k.shape
+            head_dim = channels // heads
+            self.k_reference_means[block_index] = (
+                k.detach()
+                .view(batch, -1, heads, head_dim)
+                .float()
+                .mean(dim=1)
+                .to(device="cpu", non_blocking=False)
+                .contiguous()
+            )
+            pending = self._copy_initial_slots(
+                block_index, k, v, slot_tokens, heads, tokens_per_frame
+            )
             self.pending_entries[block_index] = pending
         else:
             expected = self.SLOT_FRAMES * tokens_per_frame
@@ -528,24 +786,55 @@ class FlashVSRKVCache:
                     "FlashVSR continuation KV cache requires exactly two "
                     "new latent frames."
                 )
-            try:
-                device = self.block_storage_devices[block_index]
-                pending = (
-                    self._cache_value(k, device, "k", heads),
-                    self._cache_value(v, device, "v", heads),
-                )
-            except RuntimeError:
-                if self.block_storage_devices[block_index].type != "cuda":
-                    raise
-                self._migrate_block_to_cpu(block_index)
-                pending = (
-                    self._cache_value(k, "cpu", "k", heads),
-                    self._cache_value(v, "cpu", "v", heads),
-                )
-            self.pending_entries[block_index] = pending
+            cached_k, cached_v, _cached_summary = (
+                self.entries[block_index][self.write_slot]
+            )
+            gpu_k = self._make_gpu_value(k, "k", heads)
+            gpu_v = self._make_gpu_value(v, "v", heads)
+            if self.async_writer is not None and self.cache_format == "int8":
+                cpu_k, cpu_v = self.async_writer.submit_pair(gpu_k, gpu_v)
+            else:
+                cpu_k = self._carrier_to(gpu_k, torch.device("cpu"))
+                cpu_v = self._carrier_to(gpu_v, torch.device("cpu"))
+            summary = (
+                self._make_k_summary(k, heads, tokens_per_frame)
+                if self.cache_format == "int8" else None
+            )
+            pending = []
+            for cached, cpu_value, gpu_source in (
+                (cached_k, cpu_k, gpu_k),
+                (cached_v, cpu_v, gpu_v),
+            ):
+                if is_aimdo_value(cached):
+                    pending.append((
+                        cached,
+                        cached.prepare_update(cpu_value, gpu_source),
+                    ))
+                else:
+                    pending.append(cpu_value)
+            pending.append(summary)
+            self.pending_entries[block_index] = tuple(pending)
         self.committed_blocks.add(block_index)
 
     def clear(self):
+        writer = self.async_writer
+        if writer is not None:
+            try:
+                writer.close()
+                writer.report()
+            except Exception as error:
+                print(
+                    "[FlashVSR] async cache writer cleanup failed: "
+                    f"{error}."
+                )
+        controller = self.aimdo_controller
+        if controller is not None:
+            try:
+                if controller.device.type == "cuda":
+                    torch.cuda.synchronize(controller.device)
+            except Exception:
+                pass
+            controller.report()
         self.mode = None
         self.total_blocks = 0
         self.entries = {}
@@ -553,8 +842,7 @@ class FlashVSRKVCache:
         self.active_blocks = set()
         self.history_frames = 0
         self.slot_count = 0
-        self.block_storage_devices = {}
-        self.gpu_blocks = set()
+        self.aimdo_controller = None
         self.bytes_per_block = 0
         self.write_slot = 0
         self.initial_chunk = False
@@ -563,6 +851,8 @@ class FlashVSRKVCache:
         self.stage_v = None
         self.total_cache_bytes = 0
         self.reported = False
+        self.k_reference_means = {}
+        self.async_writer = None
 
 
 class FlashVSRRuntime:
@@ -605,6 +895,7 @@ class FlashVSRRuntime:
         self.profile_enabled = False
         self.profile_events = {}
         self.profile_devices = set()
+        self.profile_counters = {}
         self.kv_cache = FlashVSRKVCache(self)
 
     def begin_profile(self, enabled: bool):
@@ -612,6 +903,7 @@ class FlashVSRRuntime:
         self.profile_enabled = bool(enabled and torch.cuda.is_available())
         self.profile_events = {}
         self.profile_devices = set()
+        self.profile_counters = {}
         if enabled and not self.profile_enabled:
             print(
                 "[FlashVSR profiler] CUDA is unavailable; profiling disabled."
@@ -640,6 +932,26 @@ class FlashVSRRuntime:
         self.profile_events.setdefault(name, []).append(
             (start, end, device)
         )
+
+    def profile_record(self, name, start, end, device):
+        """Register events recorded on a non-default CUDA stream."""
+        if not self.profile_enabled:
+            return
+        device = torch.device(device)
+        self.profile_devices.add(device)
+        self.profile_events.setdefault(name, []).append(
+            (start, end, device)
+        )
+
+    def profile_count(self, name, value, replace=False):
+        if not self.profile_enabled:
+            return
+        if replace:
+            self.profile_counters[name] = value
+        else:
+            self.profile_counters[name] = (
+                self.profile_counters.get(name, 0) + value
+            )
 
     def finish_profile(self):
         """Synchronize once and print aggregate stage timings."""
@@ -671,7 +983,14 @@ class FlashVSRRuntime:
             "lq_linear",
             "model_total",
             "kv_cache_stage_h2d",
-            "kv_cache_write_d2h",
+            "kv_cache_compact_h2d",
+            "kv_cache_dequant_hnd",
+            "kv_current_hnd",
+            "kv_k_summary_build_d2h",
+            "kv_summary_h2d",
+            "kv_cache_commit_enqueue",
+            "kv_write_d2h",
+            "kv_write_wait_for_slot",
             "kv_cached_attention",
             "qkv_convrot_quant",
             "qkv_q_gemm",
@@ -683,6 +1002,21 @@ class FlashVSRRuntime:
             "sparge_layout_qkv",
             "sparge_mask_convert",
             "sparge_kernel",
+            "sparge_input_cast",
+            "sparge_k_smooth",
+            "sparge_q_quant",
+            "sparge_k_scale_reduce",
+            "sparge_k_int8_to_block_int8",
+            "sparge_k_native_total",
+            "sparge_qk_quant",
+            "sparge_lut",
+            "sparge_v_transpose",
+            "sparge_v_quant",
+            "sparge_v_scale_reduce",
+            "sparge_v_int8_to_fp8",
+            "sparge_v_current_to_fp8",
+            "sparge_v_native_total",
+            "sparge_attention_cuda",
             "sparge_restore",
             "result_assembly",
         )
@@ -695,11 +1029,25 @@ class FlashVSRRuntime:
                 f"[FlashVSR profiler]   {name}: {total:.2f} ms "
                 f"({count} calls, {total / count:.2f} ms/call)"
             )
+        for name in (
+            "kv_write_enqueue", "kv_write_bytes",
+            "aimdo_fault_success", "aimdo_fault_failure",
+        ):
+            if name in self.profile_counters:
+                value = self.profile_counters[name]
+                suffix = (
+                    f" ({value / (1024 ** 3):.2f} GiB)"
+                    if name.endswith("bytes") else ""
+                )
+                print(f"[FlashVSR profiler]   {name}: {value}{suffix}")
 
         nested = sum(
             totals.get(name, 0.0) for name in (
                 "kv_cache_stage_h2d",
-                "kv_cache_write_d2h",
+                "kv_cache_compact_h2d",
+                "kv_cache_dequant_hnd",
+                "kv_current_hnd",
+                "kv_cache_commit_enqueue",
                 "qkv_convrot_quant",
                 "qkv_q_gemm",
                 "qkv_k_gemm",
@@ -719,6 +1067,28 @@ class FlashVSRRuntime:
                 "[FlashVSR profiler]   model_unattributed: "
                 f"{unattributed:.2f} ms (Wan projections, MLP, cross-"
                 "attention, normalization, and unprofiled backend work)"
+            )
+        sparge_detail = sum(
+            totals.get(name, 0.0) for name in (
+                "sparge_input_cast",
+                "sparge_k_smooth",
+                "sparge_qk_quant",
+                "sparge_q_quant",
+                "sparge_k_native_total",
+                "sparge_lut",
+                "sparge_v_transpose",
+                "sparge_v_quant",
+                "sparge_v_scale_reduce",
+                "sparge_v_native_total",
+                "sparge_attention_cuda",
+            )
+        )
+        if "sparge_kernel" in totals and sparge_detail:
+            unattributed = max(0.0, totals["sparge_kernel"] - sparge_detail)
+            print(
+                "[FlashVSR profiler]   sparge_internal_unattributed: "
+                f"{unattributed:.2f} ms (allocation, dispatch, and "
+                "SpargeAttn wrapper overhead)"
             )
         lq_nested = sum(
             totals.get(name, 0.0) for name in (
@@ -745,6 +1115,7 @@ class FlashVSRRuntime:
         self.profile_enabled = False
         self.profile_events = {}
         self.profile_devices = set()
+        self.profile_counters = {}
 
     def set_attention_backend(self, backend):
         self.attention_backend = self._unwrap_attention_backend(backend)
@@ -872,8 +1243,7 @@ class FlashVSRRuntime:
                        query_block_chunk: int = 1,
                        qkv_projection: str = "stock",
                        cache_format: str = "int8",
-                       cache_vram_policy: str = "conservative",
-                       cache_vram_budget_mb: int = 0):
+                       cache_residency_backend: str = "cpu"):
         self.streaming_active = streaming
         self.sampling_mode = sampling_mode
         self.qkv_projection_mode = str(qkv_projection)
@@ -903,8 +1273,7 @@ class FlashVSRRuntime:
             faithful_mode,
             self.total_wan_blocks,
             cache_format=cache_format,
-            vram_policy=cache_vram_policy,
-            custom_vram_mb=cache_vram_budget_mb,
+            residency_backend=cache_residency_backend,
         )
         if streaming:
             capability = (
@@ -971,26 +1340,46 @@ class FlashVSRRuntime:
         cache_active = self.kv_cache.participates(block_index)
         current_k = k
         current_v = v
+        compact_descriptor = None
         if cache_active:
-            cache_marker = self.profile_start(k)
-            k, v = self.kv_cache.stage(
-                block_index, k, v, tokens_per_frame
+            use_compact_sparge = (
+                not self.kv_cache.initial_chunk
+                and self.kv_cache.cache_format == "int8"
+                and getattr(
+                    self.sparse_attention_backend,
+                    "flashvsr_block_sparse", False,
+                )
             )
-            self.profile_end("kv_cache_stage_h2d", cache_marker)
+            if use_compact_sparge:
+                compact_descriptor = self.kv_cache.describe(
+                    block_index, k, v, tokens_per_frame, heads
+                )
+            if compact_descriptor is None:
+                cache_marker = self.profile_start(k)
+                k, v = self.kv_cache.stage(
+                    block_index, k, v, tokens_per_frame
+                )
+                self.profile_end("kv_cache_stage_h2d", cache_marker)
         attention_marker = self.profile_start(q) if cache_active else None
-        attended = self._streaming_lcsa_attention(
-            block_index, q, k, v, heads,
-            attn_precision=attn_precision,
-            transformer_options=options,
-            **kwargs,
-        )
+        if compact_descriptor is not None:
+            attended = self._streaming_lcsa_attention_compact(
+                block_index, q, compact_descriptor, heads,
+                transformer_options=options,
+            )
+        else:
+            attended = self._streaming_lcsa_attention(
+                block_index, q, k, v, heads,
+                attn_precision=attn_precision,
+                transformer_options=options,
+                **kwargs,
+            )
         self.profile_end("kv_cached_attention", attention_marker)
         if cache_active:
             cache_marker = self.profile_start(current_k)
             self.kv_cache.commit(
                 block_index, current_k, current_v, tokens_per_frame, heads
             )
-            self.profile_end("kv_cache_write_d2h", cache_marker)
+            self.profile_end("kv_cache_commit_enqueue", cache_marker)
         return attended
 
     def _local_spatial_mask(self, grid_h, grid_w, local_range, device):
@@ -1185,6 +1574,21 @@ class FlashVSRRuntime:
         ).mean(dim=(2, 4, 6)).reshape(
             batch, k_temporal, spatial, heads, head_dim
         )
+        return self._lcsa_mask_from_pools(
+            q_pool, k_pool, grid_h, grid_w
+        )
+
+    def _lcsa_mask_from_pools(self, q_pool, k_pool, grid_h, grid_w):
+        """Select FlashVSR block pairs from already-pooled Q/K summaries."""
+        batch, q_temporal, spatial, heads, head_dim = q_pool.shape
+        k_temporal = k_pool.shape[1]
+        if (
+            k_pool.shape[0] != batch
+            or k_pool.shape[2] != spatial
+            or k_pool.shape[3] != heads
+            or k_pool.shape[4] != head_dim
+        ):
+            raise RuntimeError("Invalid FlashVSR cached LCSA K summary.")
         scores = torch.einsum(
             "btnhd,bsmhd->bhtnsm", q_pool, k_pool
         ) / math.sqrt(head_dim)
@@ -1234,6 +1638,76 @@ class FlashVSRRuntime:
         best = probabilities.argmax(dim=-1, keepdim=True)
         selected.scatter_(-1, best, True)
         return selected
+
+    def _streaming_lcsa_attention_compact(
+        self, block_index, q, descriptor, heads, transformer_options=None
+    ):
+        """Route from cached K summaries and materialize only final HND K/V."""
+        height = self.video.height // 16
+        width = self.video.width // 16
+        grid_h = height // 8
+        grid_w = width // 8
+        spatial = grid_h * grid_w
+        q_frames = self.current_latent_frames
+        q_temporal = q_frames // 2
+        batch, q_tokens, channels = q.shape
+        head_dim = channels // heads
+        if q_frames != self.kv_cache.SLOT_FRAMES:
+            raise RuntimeError(
+                "Compact faithful cache expected a two-frame continuation."
+            )
+
+        routing_marker = self.profile_start(q)
+        q_pool = q.view(
+            batch, q_temporal, 2, grid_h, 8, grid_w, 8,
+            heads, head_dim,
+        ).mean(dim=(2, 4, 6)).reshape(
+            batch, q_temporal, spatial, heads, head_dim
+        )
+        current_k = descriptor.current_k
+        current_pool = current_k.view(
+            batch, 1, 2, grid_h, 8, grid_w, 8,
+            heads, head_dim,
+        ).mean(dim=(2, 4, 6)).reshape(
+            batch, 1, spatial, heads, head_dim
+        )
+        summary_marker = self.profile_start(q)
+        cached_pools = tuple(
+            summary.to(
+                device=q.device, dtype=q.dtype, non_blocking=False
+            )
+            for _cached_k, _cached_v, summary in descriptor.slots
+        )
+        self.profile_end("kv_summary_h2d", summary_marker)
+        k_pool = torch.cat((*cached_pools, current_pool), dim=1)
+        block_mask = self._lcsa_mask_from_pools(
+            q_pool, k_pool, grid_h, grid_w
+        ).reshape(batch, heads, q_temporal * spatial, -1)
+        self.profile_end("lcsa_routing", routing_marker)
+
+        q_block_to_original, _ = self._lcsa_token_indices(
+            q_frames, height, width, q.device
+        )
+        slot_block_to_original, _ = self._lcsa_token_indices(
+            self.kv_cache.SLOT_FRAMES, height, width, q.device
+        )
+        try:
+            return self.sparse_attention_backend.run_flashvsr_compact(
+                q,
+                descriptor,
+                self.kv_cache,
+                heads,
+                block_mask,
+                q_block_to_original,
+                slot_block_to_original,
+                profiler=self,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "FlashVSR compact-cache Sparge Attention failed. Confirm "
+                "that the SpargeAttn wheel matches this ComfyUI Python, "
+                "PyTorch, CUDA, and GPU architecture."
+            ) from error
 
     def _streaming_lcsa_attention(self, block_index, q, k, v, heads,
                                   attn_precision=None,

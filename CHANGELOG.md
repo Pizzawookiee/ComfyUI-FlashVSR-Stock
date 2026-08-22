@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.35.0
+
+- Corrected asynchronous cache destinations so background CPU write-through
+  remains mutable when ComfyUI executes the sampler under inference mode.
+- Builds LCSA K summaries directly from the live continuation projection,
+  removing the immediate INT8 dequantize-and-reread pass used in v0.34.
+- Reduced native FP8 V preparation allocations by using one contiguous partial
+  maximum workspace and an explicit output reduction buffer.
+- Added optional TCDecoder MemBlock `torch.compile`/Inductor execution with
+  static shapes, first-use diagnostics, and automatic eager fallback. The
+  default remains eager for Dynamic VRAM compatibility.
+- Reworked FlashVSR Postprocess to support bounded GPU FP16 or CPU correction,
+  optional in-place output, and detailed per-stage profiling.
+- Quarter-resolution wavelet correction now downsamples content and style
+  before subtraction, avoiding a full-resolution difference allocation.
+
+
+## 0.34.0
+
+- Added an experimental native compact-cache Sparge adapter. Faithful INT8 K
+  is converted directly into Sparge's block-INT8 layout using one fixed
+  post-RoPE prefill reference mean per Wan layer. On the FP8 Sparge families,
+  V is materialized directly from row-INT8 history into the transposed FP8
+  kernel layout without a full FP16 history tensor.
+- Parameterized native dispatch for Sparge's SM80-family, SM89-family and SM90
+  lower ABIs. RTX 4000 / SM89 is the development target; all non-RTX-4000
+  paths are explicitly marked untested and retain automatic v0.33 fallback.
+- Replaced synchronous INT8 cache write-through with a bounded two-slot pinned
+  staging ring, dedicated CUDA transfer stream and ordinary-RAM authoritative
+  cache. AIMDO still decides residency; no manual block placement or VRAM
+  budget was introduced.
+- Added cache-write enqueue, transfer, wait, byte-count and AIMDO fault
+  profiler diagnostics.
+- Added optional TCDecoder CUDA-event profiling grouped by spatial resolution,
+  including conditioning transfer, pixel unshuffle, convolution, MemBlock,
+  TGrow, state, crop/output, wall-time, throughput and peak-memory reporting.
+- Kept all v0.33 compact materialization and public Sparge routes as guarded
+  compatibility fallbacks.
+
+## 0.33.0
+
+- Added cached K routing summaries for faithful INT8 continuations.
+- Added a compact cache descriptor path for FlashVSR Sparge Attention.
+- Dequantized cached INT8 K/V directly into final block-ordered HND buffers,
+  removing full floating-point cache staging and its second layout copy.
+- Preserved the v0.32 staging route for float/hybrid caches, dense attention,
+  initial prefill, and compatibility fallback.
+- Extended the CUDA profiler with compact-cache transfer/dequantization and
+  detailed Sparge quantization, LUT, V-layout, and lower-kernel timings.
+
+## 0.32.0
+
+- Replaced `cache_vram_policy` and `cache_vram_budget_mb` with
+  `cache_residency_backend` (`cpu` or `aimdo_experimental`).
+- Added a dedicated, deprioritized, packed AIMDO VBAR for evictable faithful
+  cache mirrors while retaining an authoritative CPU copy of every carrier.
+- Added signature and content-generation validation, transactional
+  continuation writes, CPU fallback on individual fault misses, and a
+  run-wide CPU fallback after AIMDO initialization/API failures.
+- Added AIMDO access, hit, rehydrate, miss, fallback, write-through,
+  residency, populated-byte, and host-fault-time diagnostics.
+- Kept cache precision and Wan QKV projection independent from residency.
+
 ## 0.31.0
 
 - Restored stock ComfyUI Wan Q/K/V projection as the default streaming path

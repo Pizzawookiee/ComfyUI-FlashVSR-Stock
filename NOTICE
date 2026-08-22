@@ -19,11 +19,20 @@ notice does not relicense any third-party work.
 WanVideoWrapper reference: https://github.com/kijai/ComfyUI-WanVideoWrapper
 WanVideoWrapper is distributed under the Apache License 2.0.
 
-The optional block-sparse attention adapter calls SpargeAttn's public
-block_sparse_sage2_attn_cuda API:
+The optional block-sparse attention adapter normally calls SpargeAttn's public
+block_sparse_sage2_attn_cuda API. When CUDA profiling is enabled, it mirrors
+that Apache-2.0 public function's execution sequence and calls the packaged
+quantization, LUT, V-layout, and architecture-specific kernel helpers directly
+so their costs can be measured separately:
 https://github.com/woct0rdho/SpargeAttn
 Copyright (c) 2025 Jintao Zhang, Chendong Xiang, Haofeng Huang.
 SpargeAttn is distributed separately under the Apache License 2.0.
+
+Version 0.34 additionally calls SpargeAttn's packaged architecture-specific
+lower symbols after preparing compatible Q/K/V tensors. The row-INT8 cache
+conversion, fixed-reference K preparation, direct transposed-FP8 V
+materialization, capability dispatch, and fallback logic in this repository
+are original implementations. No SpargeAttn CUDA kernel source is bundled.
 
 The temporary-attention routing design was informed by ComfyUI-RadialAttn:
 https://github.com/woct0rdho/ComfyUI-RadialAttn
@@ -35,3 +44,9 @@ https://github.com/Zironic/H3-Optimizations
 No H3-Optimizations source code is incorporated. The FlashVSR QKV and carrier
 implementation in this repository was written independently against ComfyUI
 and Comfy-Kitchen interfaces.
+
+The optional cache-residency backend uses the public ModelVBAR interfaces
+provided with ComfyUI's comfy-aimdo integration:
+https://github.com/Comfy-Org/comfy-aimdo
+comfy-aimdo is distributed under GPL-3.0. No comfy-aimdo source code is
+bundled in this repository.

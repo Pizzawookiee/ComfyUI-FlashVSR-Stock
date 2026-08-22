@@ -24,9 +24,7 @@ FAITHFUL_MODES = {
 
 QKV_PROJECTION_MODES = ["stock", "shared_int8_experimental"]
 CACHE_FORMATS = ["int8", "hybrid", "float"]
-CACHE_VRAM_POLICIES = [
-    "cpu", "conservative", "balanced", "aggressive", "custom"
-]
+CACHE_RESIDENCY_BACKENDS = ["cpu", "aimdo_experimental"]
 
 
 def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
@@ -37,8 +35,7 @@ def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
                  profile_cuda_events: bool = False,
                  qkv_projection: str = "stock",
                  cache_format: str = "int8",
-                 cache_vram_policy: str = "conservative",
-                 cache_vram_budget_mb: int = 0):
+                 cache_residency_backend: str = "cpu"):
     if sampling_mode not in SAMPLING_MODES:
         raise ValueError(f"Unknown FlashVSR sampling mode: {sampling_mode}")
     configured_new_latent_frames = int(new_latent_frames)
@@ -164,8 +161,7 @@ def make_sampler(runtime: FlashVSRRuntime, sampling_mode: str,
                 query_block_chunk=query_block_chunk,
                 qkv_projection=qkv_projection,
                 cache_format=cache_format,
-                cache_vram_policy=cache_vram_policy,
-                cache_vram_budget_mb=cache_vram_budget_mb,
+                cache_residency_backend=cache_residency_backend,
             )
             runtime.force_streaming_attention_override(transformer_options)
             progress = comfy.utils.ProgressBar(len(segments) + 1)
