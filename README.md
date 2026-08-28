@@ -1,5 +1,6 @@
 If you're having OOM errors with other ComfyUI FlashVSR nodes, try this one.
 
+If you're getting poor quality details and are using the 'ModelAttentionBackend' node, try disabling comfy kitchen attention.
 
 A 4x spatial upscale of a 10 second 0.4 MP video takes 5 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' sampler mode in bundled sampler node.
 
