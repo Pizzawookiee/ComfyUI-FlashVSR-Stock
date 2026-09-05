@@ -647,12 +647,66 @@ class Clamp(nn.Module):
         return torch.tanh(x / 3) * 3
 
 
+class SplitMemInputConv(nn.Module):
+    """Exact split of MemBlock's first Conv2d over current/past channels.
+
+    The released checkpoint stores one [Cout, 2*Cin, 3, 3] kernel. Splitting
+    that tensor along its input-channel axis gives two independent convolutions
+    whose sum is mathematically identical to Conv2d(cat(current, past)). This
+    removes the doubled-channel concat allocation and lets ComfyUI manage each
+    half-weight independently.
+    """
+
+    def __init__(self, operations, n_in, n_out, device=None, dtype=None):
+        super().__init__()
+        self.in_channels = int(n_in)
+        self.out_channels = int(n_out)
+        self.current = operations.Conv2d(
+            n_in, n_out, 3, padding=1, device=device, dtype=dtype
+        )
+        # Keep the original bias exactly once on the current branch.
+        self.past = operations.Conv2d(
+            n_in, n_out, 3, padding=1, bias=False,
+            device=device, dtype=dtype,
+        )
+
+    def forward(self, current, past):
+        output = self.current(current)
+        if past is not None:
+            output.add_(self.past(past))
+        return output
+
+    def split_state_dict(self, state_dict, prefix):
+        weight_key = f"{prefix}.weight"
+        bias_key = f"{prefix}.bias"
+        if weight_key not in state_dict:
+            return
+        weight = state_dict.pop(weight_key)
+        if weight.shape[1] != self.in_channels * 2:
+            raise RuntimeError(
+                "FlashVSR MemBlock input convolution has unexpected checkpoint "
+                f"shape {tuple(weight.shape)} at {weight_key}."
+            )
+        state_dict[f"{prefix}.current.weight"] = (
+            weight[:, :self.in_channels].contiguous()
+        )
+        state_dict[f"{prefix}.past.weight"] = (
+            weight[:, self.in_channels:].contiguous()
+        )
+        bias = state_dict.pop(bias_key, None)
+        if bias is not None:
+            state_dict[f"{prefix}.current.bias"] = bias
+
+
 class MemBlock(nn.Module):
     def __init__(self, operations, n_in, n_out, device=None, dtype=None):
         super().__init__()
         conv = lambda a, b, **kw: operations.Conv2d(a, b, 3, padding=1, device=device, dtype=dtype, **kw)
+        # Keep five Sequential slots so every later released checkpoint key
+        # remains stable. Only conv.0 changes internally to two half-width ops.
         self.conv = nn.Sequential(
-            conv(n_in * 2, n_out), nn.ReLU(inplace=True),
+            SplitMemInputConv(operations, n_in, n_out, device, dtype),
+            nn.ReLU(inplace=True),
             conv(n_out, n_out), nn.ReLU(inplace=True),
             conv(n_out, n_out),
         )
@@ -660,7 +714,10 @@ class MemBlock(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x, past):
-        return self.act(self.conv(torch.cat((x, past), dim=1)) + self.skip(x))
+        hidden = self.conv[0](x, past)
+        for index in range(1, len(self.conv)):
+            hidden = self.conv[index](hidden)
+        return self.act(hidden + self.skip(x))
 
 
 class TGrow(nn.Module):
@@ -960,7 +1017,11 @@ class TCDecoder(ManagedComponent):
         CoreModelPatcher continues to own the original convolution parameters
         and their Dynamic VRAM lifetime.
         """
-        if not self.compile_memblocks or self._compile_disabled_reason:
+        if (
+            past is None
+            or not self.compile_memblocks
+            or self._compile_disabled_reason
+        ):
             return block(current, past)
         compiler = getattr(torch, "compile", None)
         if not callable(compiler):
@@ -1028,7 +1089,7 @@ class TCDecoder(ManagedComponent):
             marker = profiler.start() if profiler is not None else None
             if isinstance(block, MemBlock):
                 stored = self.mem[index]
-                past = torch.zeros_like(current) if stored is None else stored
+                past = stored
                 updated = self._call_memblock(block, current, past)
                 if profiler is not None:
                     profiler.end(stage_name, marker)
@@ -1081,10 +1142,7 @@ class TCDecoder(ManagedComponent):
                 )
                 stored = self.mem[index]
                 if temporal == 1:
-                    if stored is None:
-                        past = torch.zeros_like(current)
-                    else:
-                        past = stored
+                    past = stored
                     updated = self._call_memblock(block, current, past)
                     if profiler is not None:
                         profiler.end(stage_name, marker)
@@ -1128,7 +1186,13 @@ class TCDecoder(ManagedComponent):
         return current.reshape(n, temporal, channels, height, width)
 
     def patch_state_dict(self, state_dict):
-        """Accept the pre-pruning TGrow layout used by some released packs."""
+        """Adapt released TCDecoder weights to optimized runtime modules."""
+        for index, layer in enumerate(self.decoder):
+            if isinstance(layer, MemBlock):
+                layer.conv[0].split_state_dict(
+                    state_dict, f"decoder.{index}.conv.0"
+                )
+
         for index, layer in enumerate(self.decoder):
             key = f"decoder.{index}.conv.weight"
             if isinstance(layer, TGrow):
