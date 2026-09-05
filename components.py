@@ -236,6 +236,9 @@ class LQProjector(ManagedComponent):
     SPATIAL_TILE_PARTS = 2
     SPATIAL_TILE_HALO = 2
     CONV2_CHANNEL_CHUNKS = 4
+    # Bound the explicit im2col patch matrix. Unlike cuDNN Conv3d workspaces,
+    # this is a hard application-level cap and scales safely to large frames.
+    CONV2_IM2COL_BUDGET_MIB = 192
 
     def __init__(self, operations, compute_dtype, device=None, weight_dtype=None):
         super().__init__(compute_dtype)
@@ -329,84 +332,164 @@ class LQProjector(ManagedComponent):
             return None
         return cache[..., ey0:ey1, ex0:ex1]
 
-    def _project_tile_streamed(
+    def _conv2_gemm_chunk_into(
+        self, chunk_index, prepared, destination,
+        crop_y0, crop_y1, crop_x0, crop_x1,
+    ):
+        """Evaluate one conv2 output-channel chunk as bounded im2col + GEMM.
+
+        The released conv2 checkpoint is already split into four 768-channel
+        Comfy-managed modules. Keep exactly one such weight chunk resident at
+        a time, while the explicit patch matrix is tiled over output H/W to
+        cap transient VRAM. This avoids both the monolithic ~3072-channel
+        Conv3d cast and the previous two-pass conv2 recomputation.
+        """
+        module = self.conv2.chunks[chunk_index]
+        kt, kh, kw = (int(value) for value in module.kernel_size)
+        st, sh, sw = (int(value) for value in module.stride)
+        batch, in_channels, temporal, _, _ = prepared.shape
+        out_t = (temporal - kt) // st + 1
+        core_h = int(crop_y1 - crop_y0)
+        core_w = int(crop_x1 - crop_x0)
+        kernel_features = in_channels * kt * kh * kw
+
+        if out_t < 1 or core_h < 1 or core_w < 1:
+            raise RuntimeError("FlashVSR conv2 GEMM received an empty output tile.")
+
+        budget_bytes = int(self.CONV2_IM2COL_BUDGET_MIB) * 1024 * 1024
+        bytes_per_position = (
+            batch * out_t * kernel_features * prepared.element_size()
+        )
+        positions = max(1, budget_bytes // max(1, bytes_per_position))
+        cols = max(1, min(core_w, positions))
+        rows = max(1, min(core_h, positions // cols))
+
+        # The LQ projector is loaded with Comfy's manual-cast operations. Use
+        # the same cast context as an ordinary Conv3d forward, but hold only
+        # this one 768-channel weight chunk while its spatial slices execute.
+        comfy.ops.run_every_op()
+        with comfy.ops.CastBiasWeightContext(
+            module, prepared, offloadable=True
+        ) as (weight, bias):
+            out_channels = int(weight.shape[0])
+            weight_matrix = weight.reshape(
+                out_channels, kernel_features
+            ).t()
+
+            for oy0 in range(crop_y0, crop_y1, rows):
+                oy1 = min(crop_y1, oy0 + rows)
+                for ox0 in range(crop_x0, crop_x1, cols):
+                    ox1 = min(crop_x1, ox0 + cols)
+                    source = prepared[
+                        :, :, :,
+                        oy0 * sh:(oy1 - 1) * sh + kh,
+                        ox0 * sw:(ox1 - 1) * sw + kw,
+                    ]
+                    patches = (
+                        source.unfold(2, kt, st)
+                        .unfold(3, kh, sh)
+                        .unfold(4, kw, sw)
+                        .permute(0, 2, 3, 4, 1, 5, 6, 7)
+                        .reshape(-1, kernel_features)
+                    )
+                    flat = (
+                        torch.addmm(bias, patches, weight_matrix)
+                        if bias is not None
+                        else patches @ weight_matrix
+                    )
+                    block_h = oy1 - oy0
+                    block_w = ox1 - ox0
+                    block = flat.reshape(
+                        batch, out_t, block_h, block_w, out_channels
+                    ).permute(0, 4, 1, 2, 3)
+                    destination[
+                        :, :, :,
+                        oy0 - crop_y0:oy1 - crop_y0,
+                        ox0 - crop_x0:ox1 - crop_x0,
+                    ].copy_(block)
+                    del source, patches, flat, block
+
+    def _project_tile_gemm(
         self, hidden, cache2_tile, crop_y0, crop_y1, crop_x0, crop_x1,
         profiler=None,
     ):
-        """Project one spatial core without a full conv2 weight/output tensor.
-
-        ChannelRMSNorm couples all 3072 conv2 channels, so the first pass
-        accumulates only the per-position squared norm. The second pass
-        recomputes one 768-channel chunk at a time, applies the shared RMS
-        denominator, and immediately accumulates that chunk through the
-        matching columns of the final Linear projection.
-        """
+        """Project one spatial core with one conv2 pass and bounded GEMMs."""
         prepared = self.conv2.prepare_input(hidden, cache2_tile)
-        norm_sq = None
+        module = self.conv2.chunks[0]
+        kt = int(module.kernel_size[0])
+        st = int(module.stride[0])
+        tile_frames = (prepared.shape[2] - kt) // st + 1
+        core_h = int(crop_y1 - crop_y0)
+        core_w = int(crop_x1 - crop_x0)
+        projected = prepared.new_empty((
+            prepared.shape[0],
+            self.conv2.out_channels,
+            tile_frames,
+            core_h,
+            core_w,
+        ))
 
+        conv_marker = (
+            profiler.profile_start(prepared)
+            if profiler is not None else None
+        )
         for chunk_index in range(self.conv2.chunk_count):
-            marker = (
-                profiler.profile_start(prepared)
-                if profiler is not None else None
+            channel_start = chunk_index * self.conv2.chunk_channels
+            channel_end = channel_start + self.conv2.chunk_channels
+            self._conv2_gemm_chunk_into(
+                chunk_index,
+                prepared,
+                projected[:, channel_start:channel_end],
+                crop_y0,
+                crop_y1,
+                crop_x0,
+                crop_x1,
             )
-            projected = self.conv2.forward_chunk(chunk_index, prepared)
-            if profiler is not None:
-                profiler.profile_end("lq_conv2", marker)
-            projected = projected[
-                ..., crop_y0:crop_y1, crop_x0:crop_x1
-            ]
-            current_sq = projected.float().square_().sum(
-                dim=1, keepdim=True
-            )
+        if profiler is not None:
+            profiler.profile_end("lq_conv2", conv_marker)
+        del prepared
+
+        # Preserve the previous streamed RMS reduction: accumulate FP32
+        # channel-norm contributions in the same 768-channel partitioning,
+        # but reuse the already-computed conv2 output instead of recomputing it.
+        norm_sq = None
+        for chunk_index in range(self.conv2.chunk_count):
+            channel_start = chunk_index * self.conv2.chunk_channels
+            channel_end = channel_start + self.conv2.chunk_channels
+            current_sq = projected[
+                :, channel_start:channel_end
+            ].float().square_().sum(dim=1, keepdim=True)
             if norm_sq is None:
                 norm_sq = current_sq
             else:
                 norm_sq.add_(current_sq)
-            del projected, current_sq
-
-        # F.normalize returns its channel norm in the activation dtype. Build
-        # that small denominator once, then release the FP32 reduction buffer
-        # before the second conv2 pass.
-        norm = norm_sq.sqrt_().to(dtype=hidden.dtype)
+        norm = norm_sq.sqrt_().to(dtype=projected.dtype)
         norm.clamp_min_(1.0e-12)
         del norm_sq
-        tile_outputs = None
-        tile_frames = None
 
+        tile_outputs = None
         for chunk_index in range(self.conv2.chunk_count):
             channel_start = chunk_index * self.conv2.chunk_channels
             channel_end = channel_start + self.conv2.chunk_channels
-            marker = (
-                profiler.profile_start(prepared)
-                if profiler is not None else None
-            )
-            projected = self.conv2.forward_chunk(chunk_index, prepared)
-            if profiler is not None:
-                profiler.profile_end("lq_conv2", marker)
-            projected = projected[
-                ..., crop_y0:crop_y1, crop_x0:crop_x1
-            ]
-            if tile_frames is None:
-                tile_frames = projected.shape[2]
-
-            marker = (
-                profiler.profile_start(projected)
+            chunk = projected[:, channel_start:channel_end]
+            norm_marker = (
+                profiler.profile_start(chunk)
                 if profiler is not None else None
             )
             gamma = self.norm2.gamma[channel_start:channel_end].to(
-                device=projected.device, dtype=projected.dtype
+                device=chunk.device, dtype=chunk.dtype
             )
-            projected.div_(norm)
-            projected.mul_(self.norm2.scale)
-            projected.mul_(gamma)
-            projected = F.silu(projected, inplace=True)
+            chunk.div_(norm)
+            chunk.mul_(self.norm2.scale)
+            chunk.mul_(gamma)
+            F.silu(chunk, inplace=True)
             if profiler is not None:
-                profiler.profile_end("lq_norm_act2", marker)
+                profiler.profile_end("lq_norm_act2", norm_marker)
 
             tile_tokens = rearrange(
-                projected, "b c f h w -> b (f h w) c"
+                chunk, "b c f h w -> b (f h w) c"
             )
-            marker = (
+            linear_marker = (
                 profiler.profile_start(tile_tokens)
                 if profiler is not None else None
             )
@@ -415,15 +498,15 @@ class LQProjector(ManagedComponent):
                 for layer in self.linear_layers
             ]
             if profiler is not None:
-                profiler.profile_end("lq_linear", marker)
+                profiler.profile_end("lq_linear", linear_marker)
             if tile_outputs is None:
                 tile_outputs = partials
             else:
                 for output, partial in zip(tile_outputs, partials):
                     output.add_(partial)
-            del projected, gamma, tile_tokens, partials
+            del chunk, gamma, tile_tokens, partials
 
-        del prepared, norm
+        del projected, norm
         return tile_outputs, tile_frames
 
     def _run_spatial_tiles(self, x, initialize_only, profiler=None):
@@ -483,7 +566,7 @@ class LQProjector(ManagedComponent):
             cache2_tile = self._cache_tile(
                 old_cache2, ey0, ey1, ex0, ex1
             )
-            tile_outputs, tile_frames = self._project_tile_streamed(
+            tile_outputs, tile_frames = self._project_tile_gemm(
                 hidden,
                 cache2_tile,
                 crop_y0,
