@@ -181,8 +181,24 @@ class StreamingAttentionDispatcher:
         if not isinstance(runtime, FlashVSRRuntime):
             runtime = self.runtime
 
+        capture_block0 = runtime.profile_should_capture_block0_attention(
+            q, k, v, mask, skip_reshape, options
+        )
+        if capture_block0:
+            runtime.profile_activation("q_post_rope", q)
+            runtime.profile_activation("k_post_rope", k)
+
         if not runtime.streaming_active:
-            return runtime.call_attention_backend(
+            result = runtime.call_attention_backend(
+                q, k, v, heads, mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                transformer_options=options,
+                **kwargs,
+            )
+        else:
+            result = runtime.streaming_attention(
                 q, k, v, heads, mask=mask,
                 attn_precision=attn_precision,
                 skip_reshape=skip_reshape,
@@ -191,14 +207,10 @@ class StreamingAttentionDispatcher:
                 **kwargs,
             )
 
-        return runtime.streaming_attention(
-            q, k, v, heads, mask=mask,
-            attn_precision=attn_precision,
-            skip_reshape=skip_reshape,
-            skip_output_reshape=skip_output_reshape,
-            transformer_options=options,
-            **kwargs,
-        )
+        if capture_block0:
+            # WanSelfAttention applies self_attn.o after this dispatcher.
+            runtime.profile_activation("self_attn_pre_o", result)
+        return result
 
 
 class FlashVSRKVCache:
@@ -896,6 +908,7 @@ class FlashVSRRuntime:
         self.profile_events = {}
         self.profile_devices = set()
         self.profile_counters = {}
+        self.profile_activation_stats = {}
         self.kv_cache = FlashVSRKVCache(self)
 
     def begin_profile(self, enabled: bool):
@@ -904,6 +917,7 @@ class FlashVSRRuntime:
         self.profile_events = {}
         self.profile_devices = set()
         self.profile_counters = {}
+        self.profile_activation_stats = {}
         if enabled and not self.profile_enabled:
             print(
                 "[FlashVSR profiler] CUDA is unavailable; profiling disabled."
@@ -952,6 +966,93 @@ class FlashVSRRuntime:
             self.profile_counters[name] = (
                 self.profile_counters.get(name, 0) + value
             )
+
+    def _profile_first_prefill_active(self):
+        return (
+            self.profile_enabled
+            and self.current_rope_start == 0
+            and self.current_latent_frames == 6
+        )
+
+    def profile_should_capture_block0_attention(
+        self, q, k, v, mask, skip_reshape, transformer_options
+    ):
+        """Identify block-0 self-attention in the six-frame prefill."""
+        if not self._profile_first_prefill_active():
+            return False
+        if mask is not None or skip_reshape:
+            return False
+        if int(transformer_options.get("block_index", -1)) != 0:
+            return False
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+            return False
+        spatial_tokens = (
+            (self.video.height // 16) * (self.video.width // 16)
+        )
+        expected_tokens = self.current_latent_frames * spatial_tokens
+        return (
+            q.shape[1] == expected_tokens
+            and k.shape[1] == expected_tokens
+            and v.shape[1] == expected_tokens
+        )
+
+    def profile_activation(self, name, tensor):
+        """Queue compact temporal activation statistics without CPU sync."""
+        if (
+            not self._profile_first_prefill_active()
+            or name in self.profile_activation_stats
+            or not torch.is_tensor(tensor)
+            or tensor.ndim != 3
+            or tensor.device.type != "cuda"
+        ):
+            return
+
+        frames = self.current_latent_frames
+        if tensor.shape[1] % frames:
+            return
+
+        with torch.no_grad():
+            values = tensor.detach().reshape(
+                tensor.shape[0], frames, -1
+            )
+            target_values_per_frame = 32768
+            stride = max(
+                1,
+                math.ceil(values.shape[-1] / target_values_per_frame),
+            )
+            sample = values[..., ::stride].float()
+
+            mean = sample.mean()
+            rms = sample.square().mean().sqrt()
+            std = (sample - mean).square().mean().sqrt()
+            max_abs = sample.abs().amax()
+
+            previous = sample[:, :-1]
+            current = sample[:, 1:]
+            dot = (previous * current).sum(dim=-1)
+            norm = (
+                previous.square().sum(dim=-1).sqrt()
+                * current.square().sum(dim=-1).sqrt()
+            ).clamp_min(1e-12)
+            temporal_cos = (dot / norm).mean()
+            previous_abs = previous.abs().mean(dim=-1)
+            current_abs = current.abs().mean(dim=-1)
+            denominator = (
+                0.5 * (previous_abs + current_abs)
+            ).clamp_min(1e-12)
+            temporal_rel_l1 = (
+                (previous - current).abs().mean(dim=-1)
+                / denominator
+            ).mean()
+
+        self.profile_devices.add(tensor.device)
+        self.profile_activation_stats[name] = {
+            "std": std,
+            "rms": rms,
+            "max_abs": max_abs,
+            "temporal_cos": temporal_cos,
+            "temporal_rel_l1": temporal_rel_l1,
+        }
 
     def finish_profile(self):
         """Synchronize once and print aggregate stage timings."""
@@ -1029,6 +1130,45 @@ class FlashVSRRuntime:
                 f"[FlashVSR profiler]   {name}: {total:.2f} ms "
                 f"({count} calls, {total / count:.2f} ms/call)"
             )
+        if self.profile_activation_stats:
+            print(
+                "[FlashVSR profiler] block0 first-prefill activation "
+                "diagnostics (sampled; timings include diagnostic kernels):"
+            )
+            print(
+                "[FlashVSR profiler]   stage                    "
+                "rms       std       max_abs   temp_cos  temp_rel_l1"
+            )
+            for name in (
+                "patch_tokens",
+                "lq_tokens",
+                "patch_plus_lq",
+                "q_post_rope",
+                "k_post_rope",
+                "self_attn_pre_o",
+                "block0_output",
+            ):
+                stats = self.profile_activation_stats.get(name)
+                if stats is None:
+                    continue
+                print(
+                    f"[FlashVSR profiler]   {name:<24} "
+                    f"{stats['rms'].item():8.4f} "
+                    f"{stats['std'].item():9.4f} "
+                    f"{stats['max_abs'].item():9.4f} "
+                    f"{stats['temporal_cos'].item():9.4f} "
+                    f"{stats['temporal_rel_l1'].item():12.4f}"
+                )
+            patch_stats = self.profile_activation_stats.get("patch_tokens")
+            lq_stats = self.profile_activation_stats.get("lq_tokens")
+            if patch_stats is not None and lq_stats is not None:
+                ratio = (
+                    lq_stats["rms"].item()
+                    / max(patch_stats["rms"].item(), 1e-12)
+                )
+                print(
+                    f"[FlashVSR profiler]   LQ / patch RMS: {ratio:.4f}"
+                )
         for name in (
             "kv_write_enqueue", "kv_write_bytes",
             "aimdo_fault_success", "aimdo_fault_failure",
@@ -1116,6 +1256,7 @@ class FlashVSRRuntime:
         self.profile_events = {}
         self.profile_devices = set()
         self.profile_counters = {}
+        self.profile_activation_stats = {}
 
     def set_attention_backend(self, backend):
         self.attention_backend = self._unwrap_attention_backend(backend)
@@ -1254,7 +1395,14 @@ class FlashVSRRuntime:
                 f"Unknown FlashVSR QKV projection mode: "
                 f"{self.qkv_projection_mode}"
             )
-        self.lcsa_sparse_ratio = max(0.1, float(sparse_ratio))
+        # Match official FlashVSR v1.1's resolution normalization:
+        # topk_ratio = sparse_ratio * 768 * 1280 / (height * width)
+        raw_sparse_ratio = float(sparse_ratio)
+        reference_pixels = 768 * 1280
+        prepared_pixels = max(1, self.video.height * self.video.width)
+        self.lcsa_sparse_ratio = (
+            raw_sparse_ratio * reference_pixels / prepared_pixels
+        )
         self.lcsa_local_range = max(1, int(local_range))
         # Zero selects a conservative value from the free CUDA memory seen by
         # the first self-attention block of each model segment.
@@ -1280,6 +1428,14 @@ class FlashVSRRuntime:
                 "available" if self.int8_qkv_format is not None
                 else "unavailable"
             )
+            if self.profile_enabled:
+                print(
+                    "[FlashVSR profiler] LCSA sparse ratio: "
+                    f"raw={raw_sparse_ratio:g}, "
+                    f"effective={self.lcsa_sparse_ratio:.6g} at "
+                    f"{self.video.width}x{self.video.height} "
+                    "(official 768x1280 normalization)."
+                )
             print(
                 f"[FlashVSR] QKV projection={self.qkv_projection_mode} "
                 f"(experimental shared path {capability})."
@@ -1856,6 +2012,12 @@ class FlashVSRRuntime:
                 "FlashVSR LQ token shape does not match Wan image tokens: "
                 f"{tuple(lq_tokens.shape)} != {tuple(args['img'].shape)}"
             )
+        if self._profile_first_prefill_active():
+            # args["img"] is stock Wan's patch-embedding output immediately
+            # before FlashVSR's sole LQ injection point.
+            self.profile_activation("patch_tokens", args["img"])
+            self.profile_activation("lq_tokens", lq_tokens)
+
         patched = dict(args)
         strength = self.conditioning_strength
         if strength == 0.0:
@@ -1867,7 +2029,17 @@ class FlashVSRRuntime:
             # alpha= also avoids materializing lq_tokens * strength.
             args["img"].add_(lq_tokens, alpha=strength)
             patched["img"] = args["img"]
-        return extra["original_block"](patched)
+        if self._profile_first_prefill_active():
+            self.profile_activation("patch_plus_lq", patched["img"])
+
+        result = extra["original_block"](patched)
+        if (
+            self._profile_first_prefill_active()
+            and isinstance(result, dict)
+            and torch.is_tensor(result.get("img"))
+        ):
+            self.profile_activation("block0_output", result["img"])
+        return result
 
     def _prepare_lq_chunk(
         self, process_index: int, new_latent_frames: int = 2

@@ -294,13 +294,17 @@ class FlashVSRStreamingSampler:
                 "step": 0.1,
                 "advanced": True,
                 "tooltip": (
-                    "Streaming-only LCSA top-k block-pair budget. Higher "
-                    "values retain more attention connections and usually "
-                    "improve motion/detail stability; lower values are more "
+                    "Raw FlashVSR v1.1 LCSA sparse ratio. Before routing it "
+                    "is normalized like the official pipeline: "
+                    "effective_ratio = sparse_ratio * 768 * 1280 / "
+                    "(prepared_width * prepared_height). Higher values retain "
+                    "more attention connections and usually improve "
+                    "motion/detail stability; lower values are more "
                     "aggressive and may look sharper but can flicker or lose "
-                    "structure. 2.0 is the stable default. With the current "
-                    "dense mask backend this is mainly a quality control, "
-                    "not a major speed or VRAM control."
+                    "structure. 2.0 is the stable released default at the "
+                    "768x1280 reference size. With the current dense mask "
+                    "backend this is mainly a quality control, not a major "
+                    "speed or VRAM control."
                 ),
             }),
             "local_range": ("INT", {
