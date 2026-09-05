@@ -173,6 +173,8 @@ class WanStreamedBlockForward:
         self.module = module
         self.original_forward = original_forward
         self.runtime = runtime
+        self._modulation_cache = None
+        self._modulation_cache_key = None
 
     def __call__(
         self,
@@ -197,20 +199,32 @@ class WanStreamedBlockForward:
 
         import comfy.model_management
 
-        if e.ndim < 4:
-            e = (
-                comfy.model_management.cast_to(
-                    self.module.modulation, dtype=x.dtype, device=x.device
-                )
-                + e
-            ).chunk(6, dim=1)
-        else:
-            e = (
-                comfy.model_management.cast_to(
-                    self.module.modulation, dtype=x.dtype, device=x.device
-                ).unsqueeze(0)
-                + e
-            ).unbind(2)
+        # FlashVSR is a one-sigma sampler: timestep modulation is invariant
+        # across its internal streaming chunks. Cache the already-cast
+        # modulation+e decomposition per block and reuse it until the next
+        # six-frame prefill (current_rope_start==0) or an input shape changes.
+        # This mirrors PR #108's lossless step-invariant modulation cache while
+        # keeping full_video_dense and non-FlashVSR model calls untouched.
+        cache_key = (
+            id(runtime),
+            int(e.ndim),
+            tuple(int(value) for value in e.shape),
+            x.dtype,
+            x.device.type,
+            x.device.index,
+        )
+        reset_cache = getattr(runtime, "current_rope_start", 0) == 0
+        if reset_cache or self._modulation_cache_key != cache_key:
+            modulation = comfy.model_management.cast_to(
+                self.module.modulation, dtype=x.dtype, device=x.device
+            )
+            if e.ndim < 4:
+                cached = (modulation + e).chunk(6, dim=1)
+            else:
+                cached = (modulation.unsqueeze(0) + e).unbind(2)
+            self._modulation_cache = tuple(cached)
+            self._modulation_cache_key = cache_key
+        e = self._modulation_cache
 
         patches = options.get("patches", {})
         x = x.contiguous()

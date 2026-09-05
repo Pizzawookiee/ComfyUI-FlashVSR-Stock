@@ -647,6 +647,71 @@ class Clamp(nn.Module):
         return torch.tanh(x / 3) * 3
 
 
+_CUDNN_FUSED_DISABLED = False
+
+
+def _resident_conv_weight(module, x):
+    weight = getattr(module, "weight", None)
+    return (
+        torch.is_tensor(weight)
+        and weight.device == x.device
+        and x.device.type == "cuda"
+    )
+
+
+def _cudnn_conv_relu(module, x):
+    """Use cuDNN's Conv(+Bias)+ReLU epilogue when weights are resident.
+
+    Direct ATen fused ops bypass ComfyUI's module forward, so they are only
+    used when CoreModelPatcher has already placed the native compute-dtype
+    weight on the same CUDA device. Any unsupported torch/cuDNN combination
+    permanently falls back to the normal managed module path for this process.
+    """
+    global _CUDNN_FUSED_DISABLED
+    if _CUDNN_FUSED_DISABLED or not _resident_conv_weight(module, x):
+        return None
+    try:
+        return torch.ops.aten.cudnn_convolution_relu(
+            x,
+            module.weight,
+            module.bias,
+            module.stride,
+            module.padding,
+            module.dilation,
+            module.groups,
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        _CUDNN_FUSED_DISABLED = True
+        return None
+
+
+def _cudnn_conv_add_relu(module, x, residual):
+    """Use cuDNN's Conv(+Bias)+residual+ReLU epilogue when available."""
+    global _CUDNN_FUSED_DISABLED
+    if (
+        _CUDNN_FUSED_DISABLED
+        or not _resident_conv_weight(module, x)
+        or residual.device != x.device
+        or residual.dtype != x.dtype
+    ):
+        return None
+    try:
+        return torch.ops.aten.cudnn_convolution_add_relu(
+            x,
+            module.weight,
+            residual,
+            1.0,
+            module.bias,
+            module.stride,
+            module.padding,
+            module.dilation,
+            module.groups,
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        _CUDNN_FUSED_DISABLED = True
+        return None
+
+
 class SplitMemInputConv(nn.Module):
     """Exact split of MemBlock's first Conv2d over current/past channels.
 
@@ -675,6 +740,25 @@ class SplitMemInputConv(nn.Module):
         if past is not None:
             output.add_(self.past(past))
         return output
+
+    def forward_relu(self, current, past):
+        # The first MemBlock convolution is immediately followed by ReLU.
+        # Fuse that epilogue without recreating the removed current/past cat.
+        if past is None:
+            output = _cudnn_conv_relu(self.current, current)
+            if output is not None:
+                return output
+            return F.relu(self.current(current), inplace=True)
+
+        past_output = self.past(past)
+        output = _cudnn_conv_add_relu(
+            self.current, current, past_output
+        )
+        if output is not None:
+            return output
+        output = self.current(current)
+        output.add_(past_output)
+        return F.relu(output, inplace=True)
 
     def split_state_dict(self, state_dict, prefix):
         weight_key = f"{prefix}.weight"
@@ -714,10 +798,24 @@ class MemBlock(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x, past):
-        hidden = self.conv[0](x, past)
-        for index in range(1, len(self.conv)):
-            hidden = self.conv[index](hidden)
-        return self.act(hidden + self.skip(x))
+        # conv.0 and conv.2 are each immediately followed by ReLU; conv.4 is
+        # followed by the residual add and final ReLU. The cuDNN ATen epilogues
+        # remove those standalone full-frame pointwise reads/writes when the
+        # managed weights are already CUDA-resident, with eager fallback.
+        hidden = self.conv[0].forward_relu(x, past)
+
+        second = _cudnn_conv_relu(self.conv[2], hidden)
+        if second is None:
+            second = F.relu(self.conv[2](hidden), inplace=True)
+        hidden = second
+
+        residual = self.skip(x)
+        output = _cudnn_conv_add_relu(self.conv[4], hidden, residual)
+        if output is None:
+            output = self.conv[4](hidden)
+            output.add_(residual)
+            output = F.relu(output, inplace=True)
+        return output
 
 
 class TGrow(nn.Module):
@@ -729,6 +827,41 @@ class TGrow(nn.Module):
     def forward(self, x):
         nt, channels, height, width = x.shape
         return self.conv(x).reshape(-1, channels, height, width)
+
+
+class LowResTGrowUpsample(nn.Module):
+    """Commute TGrow's 1x1 projection ahead of nearest 2x upsampling.
+
+    For a pointwise linear convolution P and nearest-neighbor replication U,
+    P(U(x)) == U(P(x)). Running P at the low spatial resolution therefore uses
+    one quarter of the convolution pixels while preserving the temporal unpack.
+    """
+
+    def __init__(self, operations, channels, stride, scale_factor=2,
+                 device=None, dtype=None):
+        super().__init__()
+        self.stride = int(stride)
+        self.channels = int(channels)
+        self.scale_factor = int(scale_factor)
+        self.conv = operations.Conv2d(
+            channels,
+            channels * self.stride,
+            1,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x):
+        nt, _, height, width = x.shape
+        grown = self.conv(x).reshape(
+            nt * self.stride, self.channels, height, width
+        )
+        return F.interpolate(
+            grown,
+            scale_factor=self.scale_factor,
+            mode="nearest",
+        )
 
 
 class FusedTGrowConv(nn.Module):
@@ -809,7 +942,7 @@ class _TCDecoderProfiler:
             return f"tc_memblock_{scale}x"
         if isinstance(block, nn.Upsample):
             return f"tc_upsample_{scale}x"
-        if isinstance(block, (TGrow, FusedTGrowConv)):
+        if isinstance(block, (TGrow, LowResTGrowUpsample, FusedTGrowConv)):
             return f"tc_tgrow_{scale}x"
         if isinstance(block, nn.Conv2d):
             return f"tc_conv_{scale}x"
@@ -910,6 +1043,10 @@ class TCDecoder(ManagedComponent):
             self._fuse_tgrow_layers(
                 operations, device=device, dtype=weight_dtype
             )
+        else:
+            self._move_tgrow_before_upsample(
+                operations, device=device, dtype=weight_dtype
+            )
         self.pixel_shuffle = PixelUnshuffle3D(4, 8, 8)
         self.frames_to_trim = 3
         self.clean_mem()
@@ -929,6 +1066,36 @@ class TCDecoder(ManagedComponent):
                 if channels is not None:
                     layers.extend((_identity_conv(operations, channels, device, dtype), nn.ReLU(inplace=True)))
         return nn.Sequential(*layers)
+
+    def _move_tgrow_before_upsample(self, operations, device=None, dtype=None):
+        """Replace Upsample->TGrow pairs without shifting checkpoint indices."""
+        for index in range(len(self.decoder) - 1):
+            upsample = self.decoder[index]
+            grow = self.decoder[index + 1]
+            if not isinstance(upsample, nn.Upsample) or not isinstance(
+                grow, TGrow
+            ):
+                continue
+            scale = upsample.scale_factor
+            if isinstance(scale, (tuple, list)):
+                if len(scale) != 2 or scale[0] != 2 or scale[1] != 2:
+                    continue
+                scale = 2
+            if float(scale) != 2.0:
+                continue
+            moved = LowResTGrowUpsample(
+                operations,
+                grow.conv.in_channels,
+                grow.stride,
+                scale_factor=2,
+                device=device,
+                dtype=dtype,
+            )
+            self.decoder[index] = moved
+            # Keep the original TGrow index present so all later released
+            # decoder.<index> checkpoint keys remain stable. patch_state_dict
+            # moves only this TGrow weight one slot earlier at load time.
+            self.decoder[index + 1] = nn.Identity()
 
     def _fuse_tgrow_layers(self, operations, device=None, dtype=None):
         """Replace each linear TGrow->Conv2d pair without shifting keys."""
@@ -1107,16 +1274,21 @@ class TCDecoder(ManagedComponent):
             current = self._channels_last(block(current))
             if profiler is not None:
                 profiler.end(stage_name, marker)
-            if isinstance(block, (TGrow, FusedTGrowConv)):
+            if isinstance(block, (TGrow, LowResTGrowUpsample, FusedTGrowConv)):
                 n, channels, height, width = current.shape
                 stride = block.stride
                 grown = current.reshape(
                     n // stride, stride, channels, height, width
                 )
+                next_index = (
+                    index + 2
+                    if isinstance(block, LowResTGrowUpsample)
+                    else index + 1
+                )
                 # appendleft in reverse preserves temporal order while fully
                 # completing one branch before the next branch is evaluated.
                 for branch in range(stride - 1, -1, -1):
-                    pending.appendleft((grown[:, branch], index + 1))
+                    pending.appendleft((grown[:, branch], next_index))
                 del current, grown
             else:
                 pending.appendleft((current, index + 1))
@@ -1179,7 +1351,7 @@ class TCDecoder(ManagedComponent):
             current = self._channels_last(current)
             if profiler is not None:
                 profiler.end(stage_name, marker)
-            if isinstance(block, (TGrow, FusedTGrowConv)):
+            if isinstance(block, (TGrow, LowResTGrowUpsample, FusedTGrowConv)):
                 temporal *= block.stride
 
         _, channels, height, width = current.shape
@@ -1192,6 +1364,17 @@ class TCDecoder(ManagedComponent):
                 layer.conv[0].split_state_dict(
                     state_dict, f"decoder.{index}.conv.0"
                 )
+
+        for index, layer in enumerate(self.decoder):
+            if isinstance(layer, LowResTGrowUpsample):
+                source_key = f"decoder.{index + 1}.conv.weight"
+                target_key = f"decoder.{index}.conv.weight"
+                if source_key in state_dict:
+                    weight = state_dict.pop(source_key)
+                    expected = layer.conv.weight.shape[0]
+                    if weight.shape[0] > expected:
+                        weight = weight[-expected:]
+                    state_dict[target_key] = weight
 
         for index, layer in enumerate(self.decoder):
             key = f"decoder.{index}.conv.weight"
