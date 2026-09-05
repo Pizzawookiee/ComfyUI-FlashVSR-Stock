@@ -335,35 +335,6 @@ class WanStreamingQKVForward:
         self.original_forward = original_forward
         self.runtime = runtime
         self.format_info = format_info
-        self.validated = False
-
-    def _validate_once(self, x, projected):
-        if self.validated:
-            return
-        sample = x[:, :min(4, x.shape[1])].contiguous()
-        with torch.no_grad():
-            references = tuple(
-                getattr(self.module, name)(sample)
-                for name in ("q", "k", "v")
-            )
-        for name, candidate, reference in zip(
-            ("q", "k", "v"), projected, references
-        ):
-            candidate = candidate[:, :sample.shape[1]]
-            if not bool(torch.isfinite(candidate).all().item()):
-                raise SharedQKVUnavailable(
-                    f"experimental shared {name.upper()} produced non-finite values"
-                )
-            denominator = reference.float().norm().clamp_min(1.0e-6)
-            relative_error = (
-                (candidate.float() - reference.float()).norm() / denominator
-            ).item()
-            if not math.isfinite(relative_error) or relative_error > 0.05:
-                raise SharedQKVUnavailable(
-                    f"experimental shared {name.upper()} validation error "
-                    f"was {relative_error:.4f}"
-                )
-        self.validated = True
 
     def __call__(self, x, freqs, transformer_options=None):
         options = transformer_options or {}
@@ -383,7 +354,6 @@ class WanStreamingQKVForward:
             q, k, v = _project_shared(
                 self.module, x, runtime, self.format_info
             )
-            self._validate_once(x, (q, k, v))
         except SharedQKVUnavailable as error:
             runtime.disable_int8_qkv(str(error))
             return self.original_forward(

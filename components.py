@@ -116,16 +116,117 @@ def _causal_conv_class(operations):
             )
             self.padding = (0, 0, 0)
 
-        def forward(self, x: torch.Tensor, cache_x: Optional[torch.Tensor] = None):
+        def prepare_input(
+            self, x: torch.Tensor, cache_x: Optional[torch.Tensor] = None
+        ):
             padding = list(self._causal_padding)
             if cache_x is not None and padding[4] > 0:
                 cache_x = cache_x.to(device=x.device, dtype=x.dtype)
                 x = torch.cat((cache_x, x), dim=2)
                 padding[4] = max(0, padding[4] - cache_x.shape[2])
-            x = F.pad(x, padding, mode="replicate")
+            return F.pad(x, padding, mode="replicate")
+
+        def forward_prepared(self, x: torch.Tensor):
             return super().forward(x)
 
+        def forward(self, x: torch.Tensor, cache_x: Optional[torch.Tensor] = None):
+            return self.forward_prepared(self.prepare_input(x, cache_x))
+
     return CausalConv3d
+
+class ChunkedCausalConv3d(nn.Module):
+    """Output-channel chunks of one causal Conv3d checkpoint tensor."""
+
+    def __init__(
+        self, CausalConv3d, in_channels, out_channels, kernel_size, *,
+        chunks, stride, padding, device=None, dtype=None,
+    ):
+        super().__init__()
+        if out_channels % chunks:
+            raise ValueError("Chunked causal Conv3d requires even output chunks.")
+        self.out_channels = int(out_channels)
+        self.chunk_count = int(chunks)
+        self.chunk_channels = self.out_channels // self.chunk_count
+        self.chunks = nn.ModuleList([
+            CausalConv3d(
+                in_channels, self.chunk_channels, kernel_size,
+                stride=stride, padding=padding, device=device, dtype=dtype,
+            )
+            for _ in range(self.chunk_count)
+        ])
+
+    @property
+    def weight(self):
+        # Diagnostics only. The real checkpoint weight is split across chunks.
+        return self.chunks[0].weight
+
+    @property
+    def bias(self):
+        return self.chunks[0].bias
+
+    def prepare_input(self, x, cache_x=None):
+        return self.chunks[0].prepare_input(x, cache_x)
+
+    def forward_chunk(self, index, prepared):
+        return self.chunks[index].forward_prepared(prepared)
+
+    def split_state_dict(self, state_dict, prefix):
+        weight = state_dict.pop(f"{prefix}.weight")
+        bias = state_dict.pop(f"{prefix}.bias", None)
+        for index in range(self.chunk_count):
+            start = index * self.chunk_channels
+            end = start + self.chunk_channels
+            state_dict[f"{prefix}.chunks.{index}.weight"] = (
+                weight[start:end].clone()
+            )
+            if bias is not None:
+                state_dict[f"{prefix}.chunks.{index}.bias"] = (
+                    bias[start:end].clone()
+                )
+
+
+class ChunkedLinearProjection(nn.Module):
+    """Input-channel chunks of one Linear checkpoint projection."""
+
+    def __init__(
+        self, operations, in_features, out_features, *, chunks,
+        device=None, dtype=None,
+    ):
+        super().__init__()
+        if in_features % chunks:
+            raise ValueError("Chunked linear requires even input chunks.")
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.chunk_count = int(chunks)
+        self.chunk_features = self.in_features // self.chunk_count
+        self.chunks = nn.ModuleList([
+            operations.Linear(
+                self.chunk_features, self.out_features,
+                bias=(index == 0), device=device, dtype=dtype,
+            )
+            for index in range(self.chunk_count)
+        ])
+
+    @property
+    def weight(self):
+        # Diagnostics only. The real checkpoint weight is split by columns.
+        return self.chunks[0].weight
+
+    def forward_chunk(self, index, x):
+        return self.chunks[index](x)
+
+    def split_state_dict(self, state_dict, prefix):
+        weight = state_dict.pop(f"{prefix}.weight")
+        bias = state_dict.pop(f"{prefix}.bias", None)
+        for index in range(self.chunk_count):
+            start = index * self.chunk_features
+            end = start + self.chunk_features
+            state_dict[f"{prefix}.chunks.{index}.weight"] = (
+                weight[:, start:end].contiguous()
+            )
+        if bias is not None:
+            state_dict[f"{prefix}.chunks.0.bias"] = bias.clone()
+
 
 
 class LQProjector(ManagedComponent):
@@ -134,6 +235,7 @@ class LQProjector(ManagedComponent):
     # 2x2 tile equivalent to the untiled projector inside its core.
     SPATIAL_TILE_PARTS = 2
     SPATIAL_TILE_HALO = 2
+    CONV2_CHANNEL_CHUNKS = 4
 
     def __init__(self, operations, compute_dtype, device=None, weight_dtype=None):
         super().__init__(compute_dtype)
@@ -145,17 +247,40 @@ class LQProjector(ManagedComponent):
         )
         self.norm1 = ChannelRMSNorm(2048, device=device, dtype=weight_dtype)
         self.act1 = nn.SiLU()
-        self.conv2 = CausalConv3d(
-            2048, 3072, (4, 3, 3), stride=(2, 1, 1), padding=(1, 1, 1),
-            device=device, dtype=weight_dtype,
+        self.conv2 = ChunkedCausalConv3d(
+            CausalConv3d,
+            2048,
+            3072,
+            (4, 3, 3),
+            chunks=self.CONV2_CHANNEL_CHUNKS,
+            stride=(2, 1, 1),
+            padding=(1, 1, 1),
+            device=device,
+            dtype=weight_dtype,
         )
         self.norm2 = ChannelRMSNorm(3072, device=device, dtype=weight_dtype)
         self.act2 = nn.SiLU()
         # The released v1.1 checkpoint has one projection and conditions block 0.
         self.linear_layers = nn.ModuleList([
-            operations.Linear(3072, 1536, device=device, dtype=weight_dtype)
+            ChunkedLinearProjection(
+                operations,
+                3072,
+                1536,
+                chunks=self.CONV2_CHANNEL_CHUNKS,
+                device=device,
+                dtype=weight_dtype,
+            )
         ])
         self.clear_cache()
+
+    def patch_state_dict(self, state_dict):
+        # Split only the checkpoint representation. Runtime modules remain
+        # ordinary ComfyUI-managed ops, so Dynamic VRAM/AIMDO sees bounded
+        # weights instead of one ~3072-channel Conv3d allocation.
+        self.conv2.split_state_dict(state_dict, "conv2")
+        for index, layer in enumerate(self.linear_layers):
+            layer.split_state_dict(state_dict, f"linear_layers.{index}")
+        return state_dict
 
     def clear_cache(self):
         self.cache = {"conv1": None, "conv2": None}
@@ -203,6 +328,103 @@ class LQProjector(ManagedComponent):
         if cache is None:
             return None
         return cache[..., ey0:ey1, ex0:ex1]
+
+    def _project_tile_streamed(
+        self, hidden, cache2_tile, crop_y0, crop_y1, crop_x0, crop_x1,
+        profiler=None,
+    ):
+        """Project one spatial core without a full conv2 weight/output tensor.
+
+        ChannelRMSNorm couples all 3072 conv2 channels, so the first pass
+        accumulates only the per-position squared norm. The second pass
+        recomputes one 768-channel chunk at a time, applies the shared RMS
+        denominator, and immediately accumulates that chunk through the
+        matching columns of the final Linear projection.
+        """
+        prepared = self.conv2.prepare_input(hidden, cache2_tile)
+        norm_sq = None
+
+        for chunk_index in range(self.conv2.chunk_count):
+            marker = (
+                profiler.profile_start(prepared)
+                if profiler is not None else None
+            )
+            projected = self.conv2.forward_chunk(chunk_index, prepared)
+            if profiler is not None:
+                profiler.profile_end("lq_conv2", marker)
+            projected = projected[
+                ..., crop_y0:crop_y1, crop_x0:crop_x1
+            ]
+            current_sq = projected.float().square_().sum(
+                dim=1, keepdim=True
+            )
+            if norm_sq is None:
+                norm_sq = current_sq
+            else:
+                norm_sq.add_(current_sq)
+            del projected, current_sq
+
+        # F.normalize returns its channel norm in the activation dtype. Build
+        # that small denominator once, then release the FP32 reduction buffer
+        # before the second conv2 pass.
+        norm = norm_sq.sqrt_().to(dtype=hidden.dtype)
+        norm.clamp_min_(1.0e-12)
+        del norm_sq
+        tile_outputs = None
+        tile_frames = None
+
+        for chunk_index in range(self.conv2.chunk_count):
+            channel_start = chunk_index * self.conv2.chunk_channels
+            channel_end = channel_start + self.conv2.chunk_channels
+            marker = (
+                profiler.profile_start(prepared)
+                if profiler is not None else None
+            )
+            projected = self.conv2.forward_chunk(chunk_index, prepared)
+            if profiler is not None:
+                profiler.profile_end("lq_conv2", marker)
+            projected = projected[
+                ..., crop_y0:crop_y1, crop_x0:crop_x1
+            ]
+            if tile_frames is None:
+                tile_frames = projected.shape[2]
+
+            marker = (
+                profiler.profile_start(projected)
+                if profiler is not None else None
+            )
+            gamma = self.norm2.gamma[channel_start:channel_end].to(
+                device=projected.device, dtype=projected.dtype
+            )
+            projected.div_(norm)
+            projected.mul_(self.norm2.scale)
+            projected.mul_(gamma)
+            projected = F.silu(projected, inplace=True)
+            if profiler is not None:
+                profiler.profile_end("lq_norm_act2", marker)
+
+            tile_tokens = rearrange(
+                projected, "b c f h w -> b (f h w) c"
+            )
+            marker = (
+                profiler.profile_start(tile_tokens)
+                if profiler is not None else None
+            )
+            partials = [
+                layer.forward_chunk(chunk_index, tile_tokens)
+                for layer in self.linear_layers
+            ]
+            if profiler is not None:
+                profiler.profile_end("lq_linear", marker)
+            if tile_outputs is None:
+                tile_outputs = partials
+            else:
+                for output, partial in zip(tile_outputs, partials):
+                    output.add_(partial)
+            del projected, gamma, tile_tokens, partials
+
+        del prepared, norm
+        return tile_outputs, tile_frames
 
     def _run_spatial_tiles(self, x, initialize_only, profiler=None):
         batch, _, _, height, width = x.shape
@@ -261,53 +483,30 @@ class LQProjector(ManagedComponent):
             cache2_tile = self._cache_tile(
                 old_cache2, ey0, ey1, ex0, ex1
             )
-            conv2_marker = (
-                profiler.profile_start(hidden)
-                if profiler is not None else None
+            tile_outputs, tile_frames = self._project_tile_streamed(
+                hidden,
+                cache2_tile,
+                crop_y0,
+                crop_y1,
+                crop_x0,
+                crop_x1,
+                profiler=profiler,
             )
-            projected = self.conv2(hidden, cache2_tile)
-            if profiler is not None:
-                profiler.profile_end("lq_conv2", conv2_marker)
-            norm2_marker = (
-                profiler.profile_start(projected)
-                if profiler is not None else None
-            )
-            projected = self.act2(self.norm2(projected))
-            if profiler is not None:
-                profiler.profile_end("lq_norm_act2", norm2_marker)
-
-            projected = projected[
-                ..., crop_y0:crop_y1, crop_x0:crop_x1
-            ]
-            tile_tokens = rearrange(
-                projected, "b c f h w -> b (f h w) c"
-            )
-            linear_marker = (
-                profiler.profile_start(tile_tokens)
-                if profiler is not None else None
-            )
-            tile_outputs = [
-                layer(tile_tokens) for layer in self.linear_layers
-            ]
-            if profiler is not None:
-                profiler.profile_end("lq_linear", linear_marker)
 
             if output_grids is None:
                 output_grids = [
                     value.new_empty((
-                        batch, projected.shape[2], height, width,
-                        value.shape[-1],
+                        batch, tile_frames, height, width, value.shape[-1],
                     ))
                     for value in tile_outputs
                 ]
             for grid, value in zip(output_grids, tile_outputs):
                 grid[:, :, y0:y1, x0:x1, :].copy_(
                     value.reshape(
-                        batch, projected.shape[2], core_h, core_w,
-                        value.shape[-1],
+                        batch, tile_frames, core_h, core_w, value.shape[-1],
                     )
                 )
-            del tile, hidden, current_tail, projected, tile_tokens, tile_outputs
+            del tile, hidden, current_tail, cache2_tile, tile_outputs
 
         # Do not update either temporal cache until all tiles have consumed
         # the old cache, otherwise halo overlap can observe current-clip state.
