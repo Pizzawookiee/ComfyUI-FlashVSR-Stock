@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.36.0
+- Tiling and chunking of various layers for reduced memory pressure
+- Eliminate higher precision intermediates where possible, with focus on int8
+- Support custom comfy kitchen used in https://github.com/Zironic/H3-Optimizations,
+  copy the dll in that repo's native/bin and paste it in Comfy install's models/flashvsr,
+  then use 'FlashVSR Kitchen Sparse Attention' in place of 'FlashVSR Sparge Attention' node
+- 'Prepare Video for FlashVSR' node now adds lazy upscaling,
+  i.e. only upscale low res frames when necessary rather than all at once with stock image upscale nodes.
+  Should help reduce RAM usage in some situtations.
+  That node now has new 'scale_multiplier' setting, indepedent of other comfy upscaling nodes.
+
+
 ## 0.35.0
 
 - Corrected asynchronous cache destinations so background CPU write-through
