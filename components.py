@@ -129,6 +129,12 @@ def _causal_conv_class(operations):
 
 
 class LQProjector(ManagedComponent):
+    # Two stacked 3x3 spatial convolutions give a two-cell receptive-field
+    # radius in pixel-unshuffled space. A two-cell halo therefore makes each
+    # 2x2 tile equivalent to the untiled projector inside its core.
+    SPATIAL_TILE_PARTS = 2
+    SPATIAL_TILE_HALO = 2
+
     def __init__(self, operations, compute_dtype, device=None, weight_dtype=None):
         super().__init__(compute_dtype)
         CausalConv3d = _causal_conv_class(operations)
@@ -171,6 +177,159 @@ class LQProjector(ManagedComponent):
             # Clone exactly the two causal frames into an owning buffer.
             self.cache[key] = tail.clone()
 
+    @classmethod
+    def _spatial_tiles(cls, height: int, width: int):
+        parts_y = min(cls.SPATIAL_TILE_PARTS, max(1, int(height)))
+        parts_x = min(cls.SPATIAL_TILE_PARTS, max(1, int(width)))
+        halo = cls.SPATIAL_TILE_HALO
+        for tile_y in range(parts_y):
+            y0 = height * tile_y // parts_y
+            y1 = height * (tile_y + 1) // parts_y
+            for tile_x in range(parts_x):
+                x0 = width * tile_x // parts_x
+                x1 = width * (tile_x + 1) // parts_x
+                ey0 = max(0, y0 - halo)
+                ey1 = min(height, y1 + halo)
+                ex0 = max(0, x0 - halo)
+                ex1 = min(width, x1 + halo)
+                yield (
+                    y0, y1, x0, x1,
+                    ey0, ey1, ex0, ex1,
+                    y0 - ey0, x0 - ex0,
+                )
+
+    @staticmethod
+    def _cache_tile(cache, ey0, ey1, ex0, ex1):
+        if cache is None:
+            return None
+        return cache[..., ey0:ey1, ex0:ex1]
+
+    def _run_spatial_tiles(self, x, initialize_only, profiler=None):
+        batch, _, _, height, width = x.shape
+        old_cache1 = self.cache["conv1"]
+        old_cache2 = self.cache["conv2"]
+        next_cache2 = None
+        output_grids = None
+
+        for (
+            y0, y1, x0, x1,
+            ey0, ey1, ex0, ex1,
+            crop_y0, crop_x0,
+        ) in self._spatial_tiles(height, width):
+            core_h = y1 - y0
+            core_w = x1 - x0
+            crop_y1 = crop_y0 + core_h
+            crop_x1 = crop_x0 + core_w
+
+            tile = x[..., ey0:ey1, ex0:ex1]
+            cache1_tile = self._cache_tile(
+                old_cache1, ey0, ey1, ex0, ex1
+            )
+            conv1_marker = (
+                profiler.profile_start(tile)
+                if profiler is not None else None
+            )
+            hidden = self.conv1(tile, cache1_tile)
+            if profiler is not None:
+                profiler.profile_end("lq_conv1", conv1_marker)
+            norm1_marker = (
+                profiler.profile_start(hidden)
+                if profiler is not None else None
+            )
+            hidden = self.act1(self.norm1(hidden))
+            if profiler is not None:
+                profiler.profile_end("lq_norm_act1", norm1_marker)
+
+            current_tail = hidden[:, :, -CACHE_T:]
+            if next_cache2 is None:
+                next_cache2 = hidden.new_empty((
+                    batch, hidden.shape[1], current_tail.shape[2],
+                    height, width,
+                ))
+            next_cache2[:, :, :, y0:y1, x0:x1].copy_(
+                current_tail[
+                    :, :, :,
+                    crop_y0:crop_y1,
+                    crop_x0:crop_x1,
+                ]
+            )
+
+            if initialize_only:
+                del tile, hidden, current_tail
+                continue
+
+            cache2_tile = self._cache_tile(
+                old_cache2, ey0, ey1, ex0, ex1
+            )
+            conv2_marker = (
+                profiler.profile_start(hidden)
+                if profiler is not None else None
+            )
+            projected = self.conv2(hidden, cache2_tile)
+            if profiler is not None:
+                profiler.profile_end("lq_conv2", conv2_marker)
+            norm2_marker = (
+                profiler.profile_start(projected)
+                if profiler is not None else None
+            )
+            projected = self.act2(self.norm2(projected))
+            if profiler is not None:
+                profiler.profile_end("lq_norm_act2", norm2_marker)
+
+            projected = projected[
+                ..., crop_y0:crop_y1, crop_x0:crop_x1
+            ]
+            tile_tokens = rearrange(
+                projected, "b c f h w -> b (f h w) c"
+            )
+            linear_marker = (
+                profiler.profile_start(tile_tokens)
+                if profiler is not None else None
+            )
+            tile_outputs = [
+                layer(tile_tokens) for layer in self.linear_layers
+            ]
+            if profiler is not None:
+                profiler.profile_end("lq_linear", linear_marker)
+
+            if output_grids is None:
+                output_grids = [
+                    value.new_empty((
+                        batch, projected.shape[2], height, width,
+                        value.shape[-1],
+                    ))
+                    for value in tile_outputs
+                ]
+            for grid, value in zip(output_grids, tile_outputs):
+                grid[:, :, y0:y1, x0:x1, :].copy_(
+                    value.reshape(
+                        batch, projected.shape[2], core_h, core_w,
+                        value.shape[-1],
+                    )
+                )
+            del tile, hidden, current_tail, projected, tile_tokens, tile_outputs
+
+        # Do not update either temporal cache until all tiles have consumed
+        # the old cache, otherwise halo overlap can observe current-clip state.
+        cache_marker = (
+            profiler.profile_start(x) if profiler is not None else None
+        )
+        self._store_causal_tail("conv1", x)
+        if old_cache2 is not None and old_cache2.shape == next_cache2.shape:
+            old_cache2.copy_(next_cache2)
+            self.cache["conv2"] = old_cache2
+        else:
+            self.cache["conv2"] = next_cache2
+        if profiler is not None:
+            profiler.profile_end("lq_cache_update", cache_marker)
+
+        if initialize_only:
+            return None
+        return [
+            grid.reshape(batch, -1, grid.shape[-1])
+            for grid in output_grids
+        ]
+
     def stream_forward(self, video_clip: torch.Tensor, profiler=None):
         input_marker = (
             profiler.profile_start(video_clip)
@@ -179,99 +338,25 @@ class LQProjector(ManagedComponent):
         video_clip = video_clip.to(dtype=self.compute_dtype)
         if profiler is not None:
             profiler.profile_end("lq_input_cast", input_marker)
-        if self.clip_idx == 0:
-            pixel_marker = (
-                profiler.profile_start(video_clip)
-                if profiler is not None else None
-            )
-            first = video_clip[:, :, :1].repeat(1, 1, 3, 1, 1)
-            x = self.pixel_shuffle(torch.cat((first, video_clip), dim=2))
-            if profiler is not None:
-                profiler.profile_end("lq_pixel_unshuffle", pixel_marker)
-            # FlashVSR v1.1 uses causal projector state: convolve with the
-            # previous clip's cache, then retain the current tail for the
-            # following clip. The first clip therefore uses causal replicate
-            # padding rather than feeding its own final frames back as history.
-            cache1_source = x
-            conv1_marker = (
-                profiler.profile_start(x) if profiler is not None else None
-            )
-            x = self.conv1(x, self.cache["conv1"])
-            if profiler is not None:
-                profiler.profile_end("lq_conv1", conv1_marker)
-            norm1_marker = (
-                profiler.profile_start(x) if profiler is not None else None
-            )
-            x = self.act1(self.norm1(x))
-            if profiler is not None:
-                profiler.profile_end("lq_norm_act1", norm1_marker)
-            cache_marker = (
-                profiler.profile_start(x) if profiler is not None else None
-            )
-            self._store_causal_tail("conv1", cache1_source)
-            self._store_causal_tail("conv2", x)
-            if profiler is not None:
-                profiler.profile_end("lq_cache_update", cache_marker)
-            del cache1_source
-            self.clip_idx += 1
-            return None
 
         pixel_marker = (
             profiler.profile_start(video_clip)
             if profiler is not None else None
         )
-        x = self.pixel_shuffle(video_clip)
+        initialize_only = self.clip_idx == 0
+        if initialize_only:
+            first = video_clip[:, :, :1].repeat(1, 1, 3, 1, 1)
+            x = self.pixel_shuffle(torch.cat((first, video_clip), dim=2))
+            del first
+        else:
+            x = self.pixel_shuffle(video_clip)
         if profiler is not None:
             profiler.profile_end("lq_pixel_unshuffle", pixel_marker)
-        cache1_source = x
-        conv1_marker = (
-            profiler.profile_start(x) if profiler is not None else None
+
+        output = self._run_spatial_tiles(
+            x, initialize_only=initialize_only, profiler=profiler
         )
-        x = self.conv1(x, self.cache["conv1"])
-        if profiler is not None:
-            profiler.profile_end("lq_conv1", conv1_marker)
-        norm1_marker = (
-            profiler.profile_start(x) if profiler is not None else None
-        )
-        x = self.act1(self.norm1(x))
-        if profiler is not None:
-            profiler.profile_end("lq_norm_act1", norm1_marker)
-        cache1_marker = (
-            profiler.profile_start(x) if profiler is not None else None
-        )
-        self._store_causal_tail("conv1", cache1_source)
-        if profiler is not None:
-            profiler.profile_end("lq_cache_update", cache1_marker)
-        del cache1_source
-        cache2_source = x
-        conv2_marker = (
-            profiler.profile_start(x) if profiler is not None else None
-        )
-        x = self.conv2(x, self.cache["conv2"])
-        if profiler is not None:
-            profiler.profile_end("lq_conv2", conv2_marker)
-        norm2_marker = (
-            profiler.profile_start(x) if profiler is not None else None
-        )
-        x = self.act2(self.norm2(x))
-        if profiler is not None:
-            profiler.profile_end("lq_norm_act2", norm2_marker)
-        cache2_marker = (
-            profiler.profile_start(x) if profiler is not None else None
-        )
-        self._store_causal_tail("conv2", cache2_source)
-        if profiler is not None:
-            profiler.profile_end("lq_cache_update", cache2_marker)
-        del cache2_source
-        tokens = rearrange(x, "b c f h w -> b (f h w) c")
         self.clip_idx += 1
-        linear_marker = (
-            profiler.profile_start(tokens)
-            if profiler is not None else None
-        )
-        output = [layer(tokens) for layer in self.linear_layers]
-        if profiler is not None:
-            profiler.profile_end("lq_linear", linear_marker)
         return output
 
 
