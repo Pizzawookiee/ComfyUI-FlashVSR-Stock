@@ -222,14 +222,6 @@ def apply_color_correction(
 
     frame_count, height, width, _ = images.shape
     start = video.crop_start
-    style = video.tensor[
-        0, :, start:start + frame_count, :height, :width
-    ].permute(1, 2, 3, 0)
-    if style.shape[0] != frame_count:
-        raise RuntimeError(
-            "Conditioning video is shorter than the decoded output selected "
-            "for color correction."
-        )
 
     chunk_size = max(1, int(chunk_size))
     requested = str(compute_device).lower()
@@ -262,13 +254,14 @@ def apply_color_correction(
         content_nchw = content_chunk.movedim(-1, 1).to(
             device=work_device, dtype=work_dtype
         )
-        style_nchw = (
-            style[offset:end, ..., :3]
-            .movedim(-1, 1)
-            .to(device=work_device, dtype=work_dtype)
-            .add(1.0)
-            .mul(0.5)
-        )
+        style_nchw = video.condition_frames(
+            start + offset,
+            end - offset,
+            device=work_device,
+            dtype=work_dtype,
+        )[0].permute(1, 0, 2, 3)
+        style_nchw = style_nchw[:, :, :height, :width]
+        style_nchw.add_(1.0).mul_(0.5)
         profiler.end("input_transfer", marker)
         if method.startswith("wavelet_"):
             corrected = wavelet_reconstruct(

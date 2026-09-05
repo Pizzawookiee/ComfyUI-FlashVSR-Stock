@@ -826,17 +826,27 @@ class TCDecoder(ManagedComponent):
         clamp_output=False,
         profile_cuda_events=False,
     ):
-        if latents_bcthw.ndim != 5 or condition_bcfhw.ndim != 5:
+        condition_provider = callable(
+            getattr(condition_bcfhw, "condition_frames", None)
+        )
+        if latents_bcthw.ndim != 5:
+            raise ValueError("TCDecoder expects a five-dimensional latent.")
+        if not condition_provider and condition_bcfhw.ndim != 5:
             raise ValueError(
-                "TCDecoder expects latent and conditioning video tensors "
-                "with five dimensions."
+                "TCDecoder expects either a five-dimensional conditioning "
+                "tensor or a FlashVSR lazy conditioning provider."
             )
         n, _, timesteps, _, _ = latents_bcthw.shape
         required_condition_frames = 1 + max(0, timesteps - 1) * 4
-        if condition_bcfhw.shape[2] < required_condition_frames:
+        available_condition_frames = (
+            int(condition_bcfhw.generated_frames)
+            if condition_provider
+            else int(condition_bcfhw.shape[2])
+        )
+        if available_condition_frames < required_condition_frames:
             raise RuntimeError(
                 "TCDecoder conditioning video is too short: "
-                f"{condition_bcfhw.shape[2]} < "
+                f"{available_condition_frames} < "
                 f"{required_condition_frames}."
             )
 
@@ -911,7 +921,7 @@ class TCDecoder(ManagedComponent):
             staged_count = 0
 
         condition_channels = (
-            condition_bcfhw.shape[1]
+            (3 if condition_provider else condition_bcfhw.shape[1])
             * self.pixel_shuffle.temporal
             * self.pixel_shuffle.height
             * self.pixel_shuffle.width
@@ -937,16 +947,26 @@ class TCDecoder(ManagedComponent):
             for offset in range(batch_count):
                 timestep = batch_start + offset
                 if timestep == 0:
-                    condition_clip = condition_bcfhw[:, :, :1]
+                    clip_start = 0
+                    clip_count = 1
                 else:
                     clip_start = 1 + (timestep - 1) * 4
-                    condition_clip = condition_bcfhw[
-                        :, :, clip_start:clip_start + 4
-                    ]
+                    clip_count = 4
                 marker = profiler.start()
-                condition_gpu = condition_clip.to(
-                    device=compute_device, dtype=compute_dtype
-                )
+                if condition_provider:
+                    condition_gpu = condition_bcfhw.condition_frames(
+                        clip_start,
+                        clip_count,
+                        device=compute_device,
+                        dtype=compute_dtype,
+                    )
+                else:
+                    condition_clip = condition_bcfhw[
+                        :, :, clip_start:clip_start + clip_count
+                    ]
+                    condition_gpu = condition_clip.to(
+                        device=compute_device, dtype=compute_dtype
+                    )
                 profiler.end("tc_condition_transfer", marker)
                 marker = profiler.start()
                 condition_t = self.pixel_shuffle(condition_gpu)

@@ -5,8 +5,10 @@ from dataclasses import dataclass
 import math
 
 import torch
+import torch.nn.functional as F
 
 import comfy.ldm.modules.attention as comfy_attention
+import comfy.utils
 
 from .components import ComponentHandle
 from .cache_writeback import AsyncCacheWriter
@@ -28,15 +30,60 @@ ACTIVE_RUNTIME_OPTION = "flashvsr_active_runtime"
 
 @dataclass
 class PreparedVideo:
-    tensor: torch.Tensor  # CPU BCFHW, normalized to [-1, 1]
+    source: torch.Tensor  # CPU FHWC FP16, range [0, 1]
     latent: dict
     original_frames: int
     generated_frames: int
+    padded_frames: int
     crop_start: int
+    source_width: int
+    source_height: int
     width: int
     height: int
     output_width: int
     output_height: int
+    scale_multiplier: float
+
+    def condition_frames(self, start, count, *, device, dtype):
+        """Return one normalized BCFHW conditioning window on *device*."""
+        start = int(start)
+        count = int(count)
+        if count < 1:
+            raise ValueError("FlashVSR conditioning window must be non-empty.")
+        if start < 0 or start + count > self.padded_frames:
+            raise RuntimeError(
+                "FlashVSR conditioning request is outside the prepared "
+                f"temporal range: [{start}, {start + count}) of "
+                f"{self.padded_frames} frames."
+            )
+
+        indices = torch.arange(start, start + count, dtype=torch.long)
+        indices.clamp_max_(self.original_frames - 1)
+        clip = self.source.index_select(0, indices)[..., :3]
+        clip = clip.movedim(-1, 1).to(
+            device=torch.device(device),
+            dtype=dtype,
+            non_blocking=False,
+        )
+        if (
+            clip.shape[-2] != self.output_height
+            or clip.shape[-1] != self.output_width
+        ):
+            clip = comfy.utils.common_upscale(
+                clip,
+                self.output_width,
+                self.output_height,
+                "bicubic",
+                "disabled",
+            )
+
+        pad_h = self.height - self.output_height
+        pad_w = self.width - self.output_width
+        if pad_h or pad_w:
+            clip = F.pad(clip, (0, pad_w, 0, pad_h), mode="replicate")
+
+        clip.mul_(2.0).sub_(1.0)
+        return clip.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
 
 
 @dataclass(frozen=True)
@@ -52,7 +99,10 @@ class CompactKVDescriptor:
     k_reference_mean: torch.Tensor
 
 
-def prepare_video(images: torch.Tensor) -> PreparedVideo:
+def prepare_video(
+    images: torch.Tensor,
+    scale_multiplier: float = 4.0,
+) -> PreparedVideo:
     if images.ndim != 4 or images.shape[-1] < 3:
         raise ValueError(
             "Expected ComfyUI IMAGE input with shape "
@@ -62,86 +112,25 @@ def prepare_video(images: torch.Tensor) -> PreparedVideo:
     if original_frames < 1:
         raise ValueError("At least one input frame is required.")
     if source_h < 1 or source_w < 1:
-        raise ValueError("Prepared frames must have a positive size.")
+        raise ValueError("Input frames must have a positive size.")
 
-    # The input is already at the desired output resolution. Only perform the
-    # FlashVSR-specific right/bottom alignment and normalized CPU packing.
-    target_h = math.ceil(source_h / 128) * 128
-    target_w = math.ceil(source_w / 128) * 128
+    scale_multiplier = float(scale_multiplier)
+    if not math.isfinite(scale_multiplier) or scale_multiplier <= 0.0:
+        raise ValueError("FlashVSR scale_multiplier must be positive.")
 
-    # Match the official FlashVSR temporal layout: source frame zero is the
-    # first conditioning frame and all alignment padding is appended at the
-    # tail. Pad to the next valid 8n+1 length instead of truncating so ComfyUI
-    # can still return every requested source frame.
+    output_h = max(1, int(round(source_h * scale_multiplier)))
+    output_w = max(1, int(round(source_w * scale_multiplier)))
+    target_h = math.ceil(output_h / 128) * 128
+    target_w = math.ceil(output_w / 128) * 128
+
     required_f = max(25, original_frames + 4)
     padded_f = math.ceil((required_f - 1) / 8) * 8 + 1
 
-    # Allocate the final BCFHW layout directly. The previous frame-major
-    # allocation required a second full-video copy after permuting to BCFHW.
-    video = torch.empty(
-        (1, 3, padded_f, target_h, target_w),
+    source = images[..., :3].to(
         device="cpu",
         dtype=torch.float16,
-    )
-
-    # Bound the FP32 normalization plus FP16 transfer workspace to roughly
-    # 128 MiB, reducing Python/CUDA synchronization without exposing another
-    # workflow control. On CUDA, also stay within 5% of currently free VRAM.
-    # Six bytes per RGB value: one FP32 normalized batch plus its FP16 packed
-    # transfer buffer. Keep this arithmetic independent of torch.dtype API
-    # differences across supported PyTorch releases.
-    bytes_per_frame = 3 * source_h * source_w * 6
-    working_budget = 128 * 1024 * 1024
-    if images.device.type == "cuda":
-        try:
-            free_bytes, _ = torch.cuda.mem_get_info(images.device)
-            working_budget = min(
-                working_budget,
-                max(bytes_per_frame, int(free_bytes * 0.05)),
-            )
-        except (RuntimeError, TypeError):
-            pass
-    batch_size = max(
-        1,
-        min(original_frames, working_budget // max(1, bytes_per_frame)),
-    )
-
-    for start in range(0, original_frames, batch_size):
-        end = min(start + batch_size, original_frames)
-        normalized = (
-            images[start:end, ..., :3]
-            .movedim(-1, 1)
-            .float()
-            .mul(2.0)
-            .sub(1.0)
-        )
-        packed = normalized.to(device="cpu", dtype=torch.float16)
-        current = video[0, :, start:end]
-        current[:, :, :source_h, :source_w].copy_(
-            packed.permute(1, 0, 2, 3)
-        )
-        del normalized, packed
-
-        # Replicate the right and bottom borders directly in the destination,
-        # avoiding one padded allocation per source frame.
-        if target_w > source_w:
-            current[:, :, :source_h, source_w:].copy_(
-                current[:, :, :source_h, source_w - 1:source_w].expand(
-                    -1, -1, -1, target_w - source_w
-                )
-            )
-        if target_h > source_h:
-            current[:, :, source_h:, :].copy_(
-                current[:, :, source_h - 1:source_h, :].expand(
-                    -1, -1, target_h - source_h, -1
-                )
-            )
-
-    video[:, :, original_frames:].copy_(
-        video[:, :, original_frames - 1:original_frames].expand(
-            -1, -1, padded_f - original_frames, -1, -1
-        )
-    )
+        non_blocking=False,
+    ).contiguous()
 
     latent_t = (padded_f - 1) // 4
     latent = {
@@ -151,15 +140,19 @@ def prepare_video(images: torch.Tensor) -> PreparedVideo:
         )
     }
     return PreparedVideo(
-        tensor=video,
+        source=source,
         latent=latent,
         original_frames=original_frames,
         generated_frames=padded_f - 4,
+        padded_frames=padded_f,
         crop_start=0,
+        source_width=source_w,
+        source_height=source_h,
         width=target_w,
         height=target_h,
-        output_width=source_w,
-        output_height=source_h,
+        output_width=output_w,
+        output_height=output_h,
+        scale_multiplier=scale_multiplier,
     )
 
 
@@ -2047,7 +2040,6 @@ class FlashVSRRuntime:
     ):
         device = self.lq.patcher.load_device
         dtype = self.lq.compute_dtype
-        video = self.video.tensor
         output_buffers = None
         output_offsets = None
         spatial_tokens = (
@@ -2059,14 +2051,14 @@ class FlashVSRRuntime:
         expected_tokens = expected_frames * spatial_tokens
 
         if process_index == 0:
-            clips = [
-                video[:, :, max(0, i * 4 - 3):(i + 1) * 4 - 3]
+            clip_ranges = [
+                (max(0, i * 4 - 3), (i + 1) * 4 - 3)
                 for i in range(7)
             ]
         else:
             base = process_index * 8 + 17
-            clips = [
-                video[:, :, base + i * 4:base + i * 4 + 4]
+            clip_ranges = [
+                (base + i * 4, base + i * 4 + 4)
                 for i in range(int(new_latent_frames))
             ]
 
@@ -2090,9 +2082,14 @@ class FlashVSRRuntime:
                 + ", ".join(states)
             )
 
-        for clip in clips:
+        for clip_start, clip_end in clip_ranges:
             transfer_marker = self.profile_start(device)
-            device_clip = clip.to(device=device, dtype=dtype)
+            device_clip = self.video.condition_frames(
+                clip_start,
+                clip_end - clip_start,
+                device=device,
+                dtype=dtype,
+            )
             self.profile_end("lq_input_transfer", transfer_marker)
             current = self.lq.model.stream_forward(
                 device_clip,

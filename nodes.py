@@ -159,9 +159,9 @@ class FlashVSRTCDecoderLoader:
 
 class FlashVSRPrepareVideo:
     DESCRIPTION = (
-        "Packs frames that have already been resized to the desired final "
-        "resolution. This node does not upscale. It adds only FlashVSR's "
-        "spatial and temporal padding and creates the matching Wan latent."
+        "Keeps the original low-resolution frames and builds FlashVSR "
+        "metadata/latent shapes. Bicubic conditioning is generated lazily "
+        "in bounded windows on each consumer's compute device."
     )
 
     @classmethod
@@ -169,10 +169,18 @@ class FlashVSRPrepareVideo:
         return {"required": {
             "images": ("IMAGE", {
                 "tooltip": (
-                    "Frames already resized to the intended output width "
-                    "and height. Use stock ImageScale/ImageScaleBy or any "
-                    "other resizing node first. FlashVSR is intended for "
-                    "4x restoration, although other scales may run."
+                    "Original low-resolution input frames. Do not bicubic "
+                    "upscale them before this node."
+                ),
+            }),
+            "scale_multiplier": ("FLOAT", {
+                "default": 4.0,
+                "min": 1.0,
+                "max": 8.0,
+                "step": 0.05,
+                "tooltip": (
+                    "Target spatial scale. LQ, TCDecoder and optional color "
+                    "correction resize only the frames they currently need."
                 ),
             }),
         }}
@@ -182,8 +190,8 @@ class FlashVSRPrepareVideo:
     FUNCTION = "prepare"
     CATEGORY = "FlashVSR"
 
-    def prepare(self, images):
-        prepared = prepare_video(images)
+    def prepare(self, images, scale_multiplier):
+        prepared = prepare_video(images, scale_multiplier)
         return (
             prepared,
             prepared.latent,
@@ -536,7 +544,7 @@ class FlashVSRTCDecode:
         dtype = decoder.compute_dtype
         latent_format = comfy.latent_formats.Wan21()
         latents = samples["samples"]
-        condition = video.tensor[:, :, :video.generated_frames]
+        condition = video
         decoder.model.clean_mem()
         try:
             # TCDecoder is trained to emit display-range RGB. The official

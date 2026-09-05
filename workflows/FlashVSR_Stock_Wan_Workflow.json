@@ -262,7 +262,7 @@
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 72
+          "link": 71
         }
       ],
       "outputs": [
@@ -306,7 +306,9 @@
       "properties": {
         "Node name for S&R": "FlashVSRPrepareVideo"
       },
-      "widgets_values": []
+      "widgets_values": [
+        2.0
+      ]
     },
     {
       "id": 21,
@@ -1011,14 +1013,6 @@
       71,
       21,
       0,
-      49,
-      0,
-      "IMAGE"
-    ],
-    [
-      72,
-      49,
-      0,
       2,
       0,
       "IMAGE"
@@ -1115,7 +1109,7 @@
         807.9759351313417
       ]
     },
-    "workflow_notes": "Select an input video in LoadVideo. ModelAttentionBackend must remain before FlashVSRApply. Replace it with Patch Sage Attention KJ in the same position if desired. Connect the cropped IMAGE output to your preferred video-combine node for export.",
+    "workflow_notes": "Select an input video in LoadVideo. Prepare Video for FlashVSR now receives the original low-resolution frames and lazily bicubic-resizes only the conditioning windows requested by LQ, TCDecoder and optional color correction. The example scale_multiplier is 2.0 to preserve the previous workflow output size. ImageScaleBy is intentionally left disconnected. ModelAttentionBackend must remain before FlashVSRApply. Replace it with Patch Sage Attention KJ in the same position if desired. Connect the cropped IMAGE output to your preferred video-combine node for export.",
     "frontendVersion": "1.48.7"
   },
   "version": 0.4
