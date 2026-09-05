@@ -16,6 +16,7 @@ from .aimdo_cache import (
 )
 from .qkv import Int8Carrier, carrier_nbytes, install_wan_qkv_patches
 from .sparse_backend import SPARSE_BACKEND_OPTION
+from .streamed_block import install_streamed_wan_block_patches
 
 
 # The sampler writes its runtime into per-call transformer options. ComfyUI can
@@ -2329,6 +2330,7 @@ def patch_model(model, runtime: FlashVSRRuntime):
         runtime.set_dynamic_vram(False)
     if blocks is not None:
         install_wan_qkv_patches(patched, runtime, blocks)
+        install_streamed_wan_block_patches(patched, runtime, blocks)
     else:
         runtime.configure_int8_qkv(None)
     patched.set_model_patch_replace(
