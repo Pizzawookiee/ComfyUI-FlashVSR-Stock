@@ -1,6 +1,6 @@
 If you're having OOM errors with other ComfyUI FlashVSR nodes, try this one.
 
-A 4x spatial upscale of a 10 second 0.4 MP video takes 5 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' sampler mode in bundled sampler node.
+A spatial upscale of 2x each side of a 10 second 0.4 MP video takes 5 min on a RTX 4050 6GB VRAM 16GB RAM machine with 'streaming_faithful_lowvram' sampler mode in bundled sampler node.
 
 Switch to 'streaming_faithful_lowvram' in bundled sampler node for more faithful implementation while bounded by VRAM (i.e. OOM or major slowdown); default is 'streaming' as that drops KV cache entirely and uses the least RAM with good enough results.
 
@@ -115,12 +115,14 @@ The loaders match component names rather than requiring those exact filenames,
 so compatible dtype-converted files such as `FlashVSR1_1-int8_convrot.safetensors`
 or `TCDecoder-fp16.safetensors` can also appear in the menus.
 
-The Wan 2.1 VAE is not FlashVSR-specific in this implementation. Put it in the
+The optional Wan 2.1 VAE is not FlashVSR-specific in this implementation. Put it in the
 usual ComfyUI VAE directory and load it with ComfyUI's stock VAE loader:
 
 ```text
 ComfyUI/models/vae/Wan2.1_VAE.safetensors
 ```
+
+Note that upscaling videos with this repo does not require the stock Wan 2.1 VAE.
 
 The older v1 checkpoint is not the intended main model for this integration.
 Use `FlashVSR1_1.safetensors` or a compatible conversion of the v1.1 model.
@@ -146,13 +148,22 @@ If the wheel is missing or incompatible, remove the `FlashVSR Sparge
 Attention` node and use a mask-capable ComfyUI attention backend. Sparge is not
 bundled in this repository.
 
+## Optional modified H3-Optimizations library
+
+The repo (https://github.com/Zironic/H3-Optimizations) packages a modified comfy-kitchen library which is
+compatible with this repo. Benefits include further reduction of BF16/FP16 intermediats and better support for streamed execution.
+
+To install, you must
+a) copy the dll from that repo's native/bin into Comfy's models/flashvsr
+b) use the `FlashVSR Kitchen Sparse Attention` node in place of the Sparge node.
+
+
 > [!WARNING]
 > The v0.34 native compact-cache adapter targets RTX 4000-series GPUs (SM89).
 > Sparge exposes related lower ABIs for SM80,
 > SM86, SM87, SM90, SM100, SM120, and SM121, and v0.34 parameterizes their
 > documented block/V formats, but these non-RTX-4000 paths are **untested by
-> this project**. A missing symbol, unsupported layout, or conversion error
-> disables the native route and restores the v0.33 compatibility path.
+> this project**.
 
 Compatible SM89-family kernels receive native block-INT8 K and directly
 materialized transposed-FP8 V. SM80/86/87 use native K but retain FP16 V
@@ -162,14 +173,12 @@ because that is what Sparge's Ampere kernel accepts. SM90 uses its separate
 ## Example workflow
 
 Open [`workflows/FlashVSR_Stock_Wan_Workflow.json`](workflows/FlashVSR_Stock_Wan_Workflow.json)
-in ComfyUI. The included workflow contains no personal paths, credentials, or
-other PII. Select your own input video and installed model files after loading
+in ComfyUI. Select your own input video and installed model files after loading
 it.
 
 The intended graph is:
 
-1. Load a video and resize its frames to the desired output dimensions with
-   any ComfyUI image-resize node.
+1. Load a video.
 2. Pass the already resized frames to `Prepare Video for FlashVSR`.
 3. Load the FlashVSR v1.1 DiT, prompt tensor, and LQ projector.
 4. Optionally apply `ModelAttentionBackend`, then optionally apply `FlashVSR
@@ -185,6 +194,10 @@ The intended graph is:
 The initial latent is created by `Prepare Video for FlashVSR`. It has the
 spatial and temporal shape required by the prepared video; the custom sampler
 then fills it through FlashVSR's one-step model calls.
+
+The 0.36 update changes `Prepare Video for FlashVSR` to use lazy upscaling which lowers RAM usage.
+Previously the node did not handle upscaling, requiring you to upscale frames with a Comfy upscaling node.
+Starting with 0.36 update, beware of stacking `Prepare Video for FlashVSR` upscaling with other ComfyUI image upscale nodes.
 
 ## Sampler settings
 
@@ -220,12 +233,7 @@ Cache precision is independent of the Wan checkpoint and QKV projection path.
 The default `int8` format stores K and V with per-token/per-head scales. The
 `hybrid` format keeps post-RoPE K in model precision while compacting V, and
 `float` keeps both tensors in model precision. With `int8` plus `FlashVSR
-Sparge Attention`, cached K summaries drive routing. The v0.34 native route
-converts cached K directly to Sparge block-INT8 using one fixed post-RoPE
-prefill reference mean per Wan layer. On Sparge's FP8 families, cached V is
-materialized directly into the final transposed-FP8 allocation. Hybrid/float
-caches, dense ModelAttentionBackend paths, and failed native capability checks
-retain the reusable v0.33 compatibility materialization.
+Sparge Attention`, cached K summaries drive routing.
 
 ComfyUI Dynamic VRAM remains the sole owner of model-weight offloading. The
 FlashVSR cache manager handles only mutable temporal carriers. In `cpu` mode,
@@ -323,128 +331,7 @@ CUDA kernels and optional Triton/Sparge components may initialize or compile
 on their first compatible call. Compare repeated runs only after the workflow
 has completed successfully at least once.
 
-## Release notes — 0.35.0
-
-- Fixed inference-mode compatibility in asynchronous cache write-through.
-- Computes cached K routing summaries directly from live K and reduces FP8 V
-  scale-workspace allocation.
-- Added guarded, opt-in TCDecoder MemBlock `torch.compile` support. (Currently works, but returns lots of warnings and performance gain is minimal.)
-- Added bounded GPU FP16 postprocessing, optional in-place correction and a
-  Postprocess stage profiler.
-- Quarter-resolution wavelet now downsamples before forming the color
-  difference.
-
-## Release notes — 0.34.0
-
-- Added guarded native row-INT8 → block-INT8 K preparation with a fixed
-  per-layer prefill reference mean.
-- Added direct row-INT8 → transposed-FP8 V materialization for Sparge's FP8
-  lower ABIs. RTX 4000 / SM89 is the target; every other SM path is untested.
-- Added bounded asynchronous CPU cache write-through without manual GPU block
-  placement, preserving AIMDO as the residency decision-maker.
-- Added native K/V and asynchronous write profiler stages.
-- Added an optional detailed TCDecoder CUDA profiler.
-- Preserved v0.33 compatibility fallbacks for unsupported native paths.
-
-## Release notes — 0.33.0
-
-- Added per-slot cached K summaries for faithful INT8 LCSA routing.
-- Added a descriptor-based cache handoff to the private Sparge route.
-- Dequantizes compact historical K/V directly into final HND allocations,
-  eliminating redundant FP16/BF16 cache staging on faithful continuations.
-- Extended CUDA profiling with compact H2D, direct HND dequantization/current
-  layout, and Sparge input-cast, K-smoothing, Q/K-quantization, LUT,
-  V-transpose, V-FP8-quantization, and lower CUDA-attention stages.
-- Preserved the v0.32 path for float/hybrid caches, dense attention, and the
-  initial six-frame prefill.
-
-## Release notes — 0.32.0
-
-- Replaced manual faithful-cache VRAM policies and budgets with a single
-  `cache_residency_backend` choice: reliable CPU staging or experimental
-  AIMDO residency.
-- Added a dedicated, deprioritized, packed AIMDO VBAR for mutable K/V cache
-  mirrors. CPU data remains authoritative and every access has a CPU fallback.
-- Added mapping-generation validation, transactional continuation updates,
-  per-run AIMDO failure fallback, and residency/hit/miss diagnostics.
-- Kept cache format and QKV projection independent of cache residency.
-
-## Release notes — 0.31.0
-
-- Restored stock ComfyUI Wan Q/K/V projection as the default and corrected
-  the experimental CUTLASS FP32-bias ABI.
-- Decoupled QKV execution from faithful-cache precision; compact cache storage
-  works with stock projection and any supported checkpoint dtype.
-- Added INT8, float-K/INT8-V hybrid, and floating cache formats. INT8 carrier
-  scales are now per token and attention head.
-- Added bounded per-block CPU/GPU cache placement with explicit VRAM policies
-  and individual-block CPU fallback.
-- Added experimental projection output validation and clearer cache residency
-  and transfer diagnostics.
-
-## Release notes — 0.30.0
-
-- Added a clean-room shared ConvRot INT8 QKV execution path around stock Wan
-  self-attention. Q/K/V remain separate ComfyUI-managed parameters.
-- Added sequential Dynamic VRAM weight leases as the default accelerated path
-  and a resident shared-carrier path when all three weights are already
-  resident. Both currently use three projection launches.
-- Added compact row-wise INT8 post-RoPE K/V carriers for both faithful modes,
-  with bounded per-block expansion for existing attention backends.
-- Made faithful cache placement CPU-first whenever ComfyUI Dynamic VRAM is
-  active; no second model-weight offloader is introduced.
-- Made cache-ring updates transactional so an interrupted block traversal
-  cannot commit a partial temporal step.
-- Added explicit capability/fallback diagnostics and QKV CUDA profiler stages.
-
-## Release notes — 0.20.2
-
-- Changed `streaming_faithful_lowvram` from a six-frame cache in only the
-  final ten Wan blocks to a two-frame cache in every Wan block.
-- Low-VRAM continuations now preserve immediate temporal context throughout
-  the DiT, eliminating the systematic boundary blur caused by uncached early
-  blocks while retaining approximately the previous cache footprint on a
-  30-block Wan model.
-- The low-VRAM prefill stores the final two frames of the six-frame prefill,
-  ensuring that the first continuation receives the nearest available
-  history.
-
-## Release notes — 0.20.1
-
-- Corrected LCSA routing to score logical 128-query by 128-key
-  `2×8×8` windows. Sparge conversion to physical kernel geometry now happens
-  only after logical routing.
-- Changed the continuation default from four new latent frames to two.
-- Added `streaming_faithful_full`, with a six-frame sliding post-RoPE K/V
-  cache in every Wan block.
-- Added `streaming_faithful_lowvram`, which caches the final ten Wan blocks.
-- Added conservative automatic GPU/CPU cache placement, reusable one-block
-  staging buffers, cache lifecycle validation, and KV transfer profiling.
-- Faithful cache modes require a single conditional pass through BasicGuider
-  or ComfyUI's active CFG=1 optimization.
-
-## Previous release — 0.20.0
-
-- Public-release packaging and Comfy Registry metadata.
-- Added the example stock-Wan workflow after a PII/secret audit.
-- Added the registry publishing GitHub Action.
-- Reworked installation, workflow, tuning, attention, and implementation
-  comparison documentation.
-- Sampling and decoding behavior are unchanged from the validated 0.19.9
-  baseline: `topk(sorted=False)` LCSA selection and the expanded CUDA profiler
-  remain available.
-
-## Publishing checklist
-
-Before the first Comfy Registry publish:
-
-1. Confirm the `Pizzawookiee` publisher exists in the Comfy Registry and that
-   the publishing token has permission to publish `comfyui-flashvsr-stock`.
-2. Optionally add a repository-relative icon and update `Icon`; do not use the
-   placeholder example URL from the Registry template.
-3. Add the repository secret `REGISTRY_ACCESS_TOKEN` in GitHub Actions.
-4. Commit a `pyproject.toml` change on `main`, or manually dispatch
-   `.github/workflows/publish_action.yml`.
+## Release notes — see CHANGELOG.md
 
 ## Credits and license
 
@@ -454,8 +341,9 @@ This project reimplements components described by
 packaging follow the files published at
 [pizzawookiee/FlashVSR-1.1](https://huggingface.co/pizzawookiee/FlashVSR-1.1/tree/main).
 The optional sparse executor calls the separately distributed
-[SpargeAttn](https://github.com/woct0rdho/SpargeAttn) library. See
-[`NOTICE`](NOTICE) for attribution details.
+[SpargeAttn](https://github.com/woct0rdho/SpargeAttn) library.
+This repo can also use the modified comfy-kitchen library in [H3-Optimizations] (https://github.com/Zironic/H3-Optimizations).
+See [`NOTICE`](NOTICE) for attribution details.
 
 The repository code is licensed under `GPL-3.0-only`. This conservative choice
 covers the GPLv3 implementation references used during development while still
