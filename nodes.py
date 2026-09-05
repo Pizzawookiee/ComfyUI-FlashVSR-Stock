@@ -20,6 +20,7 @@ from .sampler import (
     make_sampler,
 )
 from .sparse_backend import apply_sparge_backend
+from .kitchen_sparse_backend import apply_kitchen_backend
 
 
 DTYPES = ["auto", "bf16", "fp16", "fp32"]
@@ -255,6 +256,31 @@ class FlashVSRBlockSparseAttention:
 
     def patch(self, model):
         return (apply_sparge_backend(model),)
+
+
+class FlashVSRKitchenSparseAttention:
+    DESCRIPTION = (
+        "Executes FlashVSR's existing logical 128-query by 128-key LCSA "
+        "mask with the native INT8 Comfy-Kitchen-derived sparse kernel used "
+        "by H3-Optimizations. This is a drop-in alternative to FlashVSR "
+        "Sparge Attention: dense self-attention, cross-attention and "
+        "full_video_dense still use the model's selected ComfyUI backend. "
+        "The adapter loads the plain-C ABI DLL directly and does not require "
+        "the H3 custom node or a SpargeAttn wheel. Put "
+        "h3_int8_attention_v5.dll (preferred) or h3_int8_attention.dll in "
+        "ComfyUI/models/flashvsr beside the FlashVSR checkpoints."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": ("MODEL",)}}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "FlashVSR/model_patches"
+
+    def patch(self, model):
+        return (apply_kitchen_backend(model),)
 
 
 class FlashVSRStreamingSampler:
@@ -656,6 +682,7 @@ NODE_CLASS_MAPPINGS = {
     "FlashVSRPrepareVideo": FlashVSRPrepareVideo,
     "FlashVSRApply": FlashVSRApply,
     "FlashVSRBlockSparseAttention": FlashVSRBlockSparseAttention,
+    "FlashVSRKitchenSparseAttention": FlashVSRKitchenSparseAttention,
     "FlashVSRStreamingSampler": FlashVSRStreamingSampler,
     "FlashVSRTCDecode": FlashVSRTCDecode,
     "FlashVSRCropFrames": FlashVSRCropFrames,
@@ -670,6 +697,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FlashVSRApply": "Configure FlashVSR Upscaling",
     "FlashVSRBlockSparseAttention": (
         "FlashVSR Sparge Attention"
+    ),
+    "FlashVSRKitchenSparseAttention": (
+        "FlashVSR Kitchen Sparse Attention"
     ),
     "FlashVSRStreamingSampler": "FlashVSR One-Step Sampler",
     "FlashVSRTCDecode": "FlashVSR Tiny Decode",
