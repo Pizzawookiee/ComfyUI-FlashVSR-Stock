@@ -8,6 +8,7 @@ dispatcher while still benefiting from FFN and Linear activation chunking.
 
 from __future__ import annotations
 
+import math
 import torch
 
 
@@ -98,10 +99,17 @@ def _slice_e(e, total_tokens, start, end, device):
 
 def _modulated_gather(norm, x, shift, scale, token_indices):
     total = int(x.shape[1])
-    current = x.index_select(1, token_indices)
-    current = norm(current)
+    current = x.index_select(1, token_indices).contiguous()
     shift_rows = _gather_e(shift, total, token_indices)
     scale_rows = _gather_e(scale, total, token_indices)
+    if getattr(norm, "elementwise_affine", False) is False:
+        from .wan_fused_ops import layer_norm_modulate
+        fused = layer_norm_modulate(
+            current, shift_rows, scale_rows, getattr(norm, "eps", 1e-5)
+        )
+        if fused is not None:
+            return fused
+    current = norm(current)
     current.mul_(scale_rows + 1)
     current.add_(shift_rows)
     return current
@@ -109,9 +117,17 @@ def _modulated_gather(norm, x, shift, scale, token_indices):
 
 def _modulated_slice(norm, x, shift, scale, start, end):
     total = int(x.shape[1])
-    current = norm(x[:, start:end])
+    current = x[:, start:end]
     shift_rows = _slice_e(shift, total, start, end, x.device)
     scale_rows = _slice_e(scale, total, start, end, x.device)
+    if getattr(norm, "elementwise_affine", False) is False:
+        from .wan_fused_ops import layer_norm_modulate
+        fused = layer_norm_modulate(
+            current, shift_rows, scale_rows, getattr(norm, "eps", 1e-5)
+        )
+        if fused is not None:
+            return fused
+    current = norm(current)
     current.mul_(scale_rows + 1)
     current.add_(shift_rows)
     return current
@@ -129,6 +145,10 @@ def _build_modulated_input(norm, x, shift, scale, chunk_tokens):
 
 
 def _gate_add_inplace(x, y, gate, chunk_tokens):
+    if gate.size(1) == 1:
+        from .wan_fused_ops import gate_add_inplace
+        if gate_add_inplace(x, y, gate):
+            return
     total = int(x.shape[1])
     for start in range(0, total, chunk_tokens):
         end = min(start + chunk_tokens, total)
@@ -311,6 +331,85 @@ class _WanRopeEncodeCache:
         )
 
 
+class _SteadyThresholdMask:
+    """PR #108-style per-block steady LCSA threshold reuse.
+
+    Prefill and the first continuation use the original top-k threshold. Later
+    continuations reuse that first steady threshold for the same block/geometry.
+    The best-key scatter remains active, so every query row always has a route.
+    """
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.thresholds = {}
+
+    def __call__(self, q_pool, k_pool, grid_h, grid_w):
+        runtime = self.runtime
+        batch, q_temporal, spatial, heads, head_dim = q_pool.shape
+        k_temporal = k_pool.shape[1]
+        if (
+            k_pool.shape[0] != batch
+            or k_pool.shape[2] != spatial
+            or k_pool.shape[3] != heads
+            or k_pool.shape[4] != head_dim
+        ):
+            raise RuntimeError("Invalid FlashVSR cached LCSA K summary.")
+        scores = torch.einsum(
+            "btnhd,bsmhd->bhtnsm", q_pool, k_pool
+        ) / math.sqrt(head_dim)
+        scores = scores.reshape(
+            batch, heads, q_temporal, spatial,
+            k_temporal * spatial,
+        ).float()
+
+        local, eligible_count = runtime._local_block_topology(
+            q_temporal, k_temporal, grid_h, grid_w,
+            runtime.lcsa_local_range, scores.device,
+        )
+        scores.masked_fill_(~local, -torch.inf)
+        probabilities = torch.softmax(scores, dim=-1)
+        flat = probabilities.reshape(batch, heads, q_temporal, -1)
+        requested = int(spatial * spatial * runtime.lcsa_sparse_ratio) - 1
+        selected_count = min(max(1, requested), flat.shape[-1] - 1)
+        if selected_count >= eligible_count:
+            selected = probabilities > 0
+            best = probabilities.argmax(dim=-1, keepdim=True)
+            selected.scatter_(-1, best, True)
+            return selected
+
+        block_index = int(getattr(runtime, "_flashvsr_threshold_block", -1))
+        steady = int(getattr(runtime, "current_rope_start", 0)) > 0
+        if not steady and block_index == 0 and self.thresholds:
+            self.thresholds.clear()
+        key = (
+            block_index, batch, heads, q_temporal, grid_h, grid_w,
+            k_temporal, runtime.lcsa_local_range, selected_count,
+            float(runtime.lcsa_sparse_ratio),
+            scores.device.type, scores.device.index,
+        )
+        threshold = self.thresholds.get(key) if steady and block_index >= 0 else None
+        if threshold is None:
+            top_values = torch.topk(
+                flat, k=selected_count + 1, dim=-1, sorted=False
+            ).values
+            threshold = top_values.amin(dim=-1, keepdim=True)
+            if steady and block_index >= 0:
+                self.thresholds[key] = threshold.detach().clone()
+        selected = (flat > threshold).view_as(probabilities)
+        best = probabilities.argmax(dim=-1, keepdim=True)
+        selected.scatter_(-1, best, True)
+        return selected
+
+
+def _install_threshold_cache(runtime):
+    wrapper = getattr(runtime, "_flashvsr_threshold_wrapper", None)
+    if wrapper is None:
+        wrapper = _SteadyThresholdMask(runtime)
+        runtime._flashvsr_threshold_wrapper = wrapper
+        runtime._lcsa_mask_from_pools = wrapper
+    return wrapper
+
+
 class WanStreamedBlockForward:
     """Memory-bounded equivalent of stock WanAttentionBlock.forward."""
 
@@ -372,6 +471,7 @@ class WanStreamedBlockForward:
         e = self._modulation_cache
 
         patches = options.get("patches", {})
+        runtime._flashvsr_threshold_block = int(options.get("block_index", -1))
         x = x.contiguous()
         chunk = _ffn_chunk_tokens(x, self.module)
 
@@ -457,6 +557,7 @@ def _patch_linear(patcher, path, module, runtime):
 def install_streamed_wan_block_patches(patcher, runtime, blocks):
     if not blocks:
         return
+    _install_threshold_cache(runtime)
 
     # Stock Wan reconstructs the complete T/H/W RoPE tensor every model call.
     # FlashVSR varies only temporal shift across its streaming chunks, so patch
