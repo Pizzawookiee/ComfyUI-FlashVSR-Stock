@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.37.0
+- Added streamed Kitchen attention output projection to reduce large pre-output intermediate allocations.
+- Added additional cached routing metadata for sparse attention.
+- Added cached spatial H/W RoPE construction, while preserving per-segment temporal RoPE updates.
+- Added Triton fused LayerNorm + AdaLN modulation for Wan DiT rows, with automatic fallback to the existing PyTorch path.
+- Added Triton fused gated-residual updates to reduce repeated elementwise kernel launches.
+- Added steady sparse-mask threshold reuse across continuation chunks to reduce repeated top-k work.
+- Improved TCDecoder performance with split recurrent convolutions, low-resolution TGrow execution,
+channels-last support and fused cuDNN Conv/Add/ReLU paths.
+- Improved LQ projector memory efficiency with tiled im2col + GEMM execution and bounded Conv2 working memory.
+- Reduced unnecessary intermediate tensors and allocation churn throughout the streaming inference path.
+- Continued optimizing faithful low-VRAM execution for 6 GB-class GPUs without changing the model architecture or checkpoint format.
+
 ## 0.36.0
 - Tiling and chunking of various layers for reduced memory pressure
 - Eliminate higher precision intermediates where possible, with focus on int8
