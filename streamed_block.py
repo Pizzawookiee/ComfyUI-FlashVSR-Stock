@@ -166,6 +166,151 @@ class _ChunkedLinearForward:
         return output
 
 
+class _WanRopeEncodeCache:
+    """Cache stock Wan's spatial RoPE rotations across FlashVSR chunks.
+
+    FlashVSR changes only the temporal shift between internal model calls.
+    Height/width positions and their rotations are invariant at a fixed video
+    geometry, so retain only that compact spatial component and rebuild the
+    shifted temporal component for each chunk. Unsupported/non-streaming calls
+    use stock ComfyUI's bound rope_encode unchanged.
+    """
+
+    MAX_SPATIAL_ENTRIES = 4
+
+    def __init__(self, module, original_forward, runtime):
+        self.module = module
+        self.original_forward = original_forward
+        self.runtime = runtime
+        self.spatial_cache = {}
+
+    def __call__(
+        self,
+        t,
+        h,
+        w,
+        t_start=0,
+        steps_t=None,
+        steps_h=None,
+        steps_w=None,
+        device=None,
+        dtype=None,
+        transformer_options=None,
+        source_id=0,
+        **kwargs,
+    ):
+        options = transformer_options or {}
+        runtime = _runtime_from_options(self.runtime, options)
+        embedder = getattr(self.module, "rope_embedder", None)
+        axes_dim = getattr(embedder, "axes_dim", None)
+        theta = getattr(embedder, "theta", None)
+        patch_size = getattr(self.module, "patch_size", None)
+        if (
+            not _streaming(runtime)
+            or source_id
+            or kwargs
+            or device is None
+            or dtype is None
+            or patch_size is None
+            or axes_dim is None
+            or len(axes_dim) != 3
+            or theta is None
+        ):
+            return self.original_forward(
+                t, h, w,
+                t_start=t_start,
+                steps_t=steps_t,
+                steps_h=steps_h,
+                steps_w=steps_w,
+                device=device,
+                dtype=dtype,
+                transformer_options=options,
+                source_id=source_id,
+                **kwargs,
+            )
+
+        # Match stock comfy.ldm.wan.model.WanModel.rope_encode exactly.
+        t_len = ((t + (patch_size[0] // 2)) // patch_size[0])
+        h_len = ((h + (patch_size[1] // 2)) // patch_size[1])
+        w_len = ((w + (patch_size[2] // 2)) // patch_size[2])
+        if steps_t is None:
+            steps_t = t_len
+        if steps_h is None:
+            steps_h = h_len
+        if steps_w is None:
+            steps_w = w_len
+
+        h_start = 0
+        w_start = 0
+        rope_options = options.get("rope_options")
+        if rope_options is not None:
+            t_len = (t_len - 1.0) * rope_options.get("scale_t", 1.0) + 1.0
+            h_len = (h_len - 1.0) * rope_options.get("scale_y", 1.0) + 1.0
+            w_len = (w_len - 1.0) * rope_options.get("scale_x", 1.0) + 1.0
+            t_start += rope_options.get("shift_t", 0.0)
+            h_start += rope_options.get("shift_y", 0.0)
+            w_start += rope_options.get("shift_x", 0.0)
+
+        steps_t = int(steps_t)
+        steps_h = int(steps_h)
+        steps_w = int(steps_w)
+        target = torch.device(device)
+        cache_key = (
+            steps_h, steps_w,
+            float(h_start), float(h_len),
+            float(w_start), float(w_len),
+            int(axes_dim[1]), int(axes_dim[2]), float(theta),
+            dtype, target.type, target.index,
+        )
+        spatial = self.spatial_cache.get(cache_key)
+        if spatial is None:
+            from comfy.ldm.flux.math import rope
+
+            h_pos = torch.linspace(
+                h_start, h_start + (h_len - 1),
+                steps=steps_h, device=target, dtype=dtype,
+            )
+            w_pos = torch.linspace(
+                w_start, w_start + (w_len - 1),
+                steps=steps_w, device=target, dtype=dtype,
+            )
+            h_rot = rope(h_pos.unsqueeze(0), int(axes_dim[1]), theta)[0]
+            w_rot = rope(w_pos.unsqueeze(0), int(axes_dim[2]), theta)[0]
+            h_rot = h_rot[:, None].expand(
+                steps_h, steps_w, *h_rot.shape[1:]
+            )
+            w_rot = w_rot[None, :].expand(
+                steps_h, steps_w, *w_rot.shape[1:]
+            )
+            spatial = torch.cat((h_rot, w_rot), dim=-3).reshape(
+                steps_h * steps_w, -1, 2, 2
+            ).contiguous()
+            if len(self.spatial_cache) >= self.MAX_SPATIAL_ENTRIES:
+                self.spatial_cache.clear()
+            self.spatial_cache[cache_key] = spatial
+
+        from comfy.ldm.flux.math import rope
+
+        t_pos = torch.linspace(
+            t_start, t_start + (t_len - 1),
+            steps=steps_t, device=target, dtype=dtype,
+        )
+        temporal = rope(t_pos.unsqueeze(0), int(axes_dim[0]), theta)[0]
+        spatial_tokens = steps_h * steps_w
+        temporal_pairs = temporal.shape[-3]
+        spatial_pairs = spatial.shape[-3]
+        freqs = torch.empty(
+            (steps_t, spatial_tokens, temporal_pairs + spatial_pairs, 2, 2),
+            device=target, dtype=temporal.dtype,
+        )
+        freqs[:, :, :temporal_pairs].copy_(temporal[:, None])
+        freqs[:, :, temporal_pairs:].copy_(spatial[None])
+        return freqs.reshape(
+            1, steps_t * spatial_tokens, 1,
+            temporal_pairs + spatial_pairs, 2, 2,
+        )
+
+
 class WanStreamedBlockForward:
     """Memory-bounded equivalent of stock WanAttentionBlock.forward."""
 
@@ -312,6 +457,25 @@ def _patch_linear(patcher, path, module, runtime):
 def install_streamed_wan_block_patches(patcher, runtime, blocks):
     if not blocks:
         return
+
+    # Stock Wan reconstructs the complete T/H/W RoPE tensor every model call.
+    # FlashVSR varies only temporal shift across its streaming chunks, so patch
+    # the model-level encoder to reuse the invariant spatial rotations.
+    diffusion_model = None
+    try:
+        diffusion_model = patcher.get_model_object("diffusion_model")
+    except (AttributeError, KeyError, TypeError, RuntimeError):
+        diffusion_model = getattr(
+            getattr(patcher, "model", None), "diffusion_model", None
+        )
+    rope_encode = getattr(diffusion_model, "rope_encode", None)
+    module_name = getattr(type(diffusion_model), "__module__", "")
+    if callable(rope_encode) and module_name == "comfy.ldm.wan.model":
+        patcher.add_object_patch(
+            "diffusion_model.rope_encode",
+            _WanRopeEncodeCache(diffusion_model, rope_encode, runtime),
+        )
+
     for index, block in enumerate(blocks):
         required = (
             "norm1", "self_attn", "norm2", "norm3",

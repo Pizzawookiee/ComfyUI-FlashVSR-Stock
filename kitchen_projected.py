@@ -32,6 +32,14 @@ from .qkv import Int8Carrier
 
 
 PROJECT_CHUNK = 1024
+O_PROJ_CHUNK = 8192
+
+
+# Tiny shape/device metadata reused by every projected Kitchen Wan block.
+# Keep these bounded because ComfyUI can run many resolutions in one process.
+_ANCHOR_META_CACHE = {}
+_ROUTE_META_CACHE = {}
+_ROUTE_ENCODING = None
 
 
 def _gather_freqs(freqs, indices, sequence):
@@ -129,8 +137,59 @@ def _slice_carrier(carrier, start, end):
     )
 
 
+def _route_static_metadata(kv_tiles, device):
+    device = torch.device(device)
+    key = (int(kv_tiles), device.type, device.index)
+    cached = _ROUTE_META_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    candidates = torch.arange(
+        kv_tiles, device=device, dtype=torch.int32
+    ).view(1, 1, 1, kv_tiles)
+    sentinel = torch.full(
+        (), kv_tiles, device=device, dtype=torch.int32
+    )
+    cached = (candidates, sentinel)
+    if len(_ROUTE_META_CACHE) >= 16:
+        _ROUTE_META_CACHE.clear()
+    _ROUTE_META_CACHE[key] = cached
+    return cached
+
+
+def _mask_to_route_cached(mask):
+    """Pack Kitchen's LUT while reusing geometry-only CUDA metadata."""
+    selected = mask.to(dtype=torch.bool)
+    counts = selected.sum(dim=-1, dtype=torch.int32).contiguous()
+    if bool((counts == 0).any()):
+        raise RuntimeError(
+            "FlashVSR Kitchen received an LCSA row with no selected KV blocks."
+        )
+
+    kv_tiles = int(selected.shape[-1])
+    candidates, sentinel = _route_static_metadata(kv_tiles, selected.device)
+    packed = torch.where(selected, candidates, sentinel)
+    packed = packed.sort(dim=-1).values.contiguous()
+    return kb.BlockSparseRoute(
+        indices=packed,
+        counts=counts,
+        q_tile=kb.Q_TILE,
+        kv_tile=kb.KV_TILE,
+        encoding="absolute",
+    )
+
+
+def _route_for_kernel(route):
+    global _ROUTE_ENCODING
+    if _ROUTE_ENCODING is None:
+        _ROUTE_ENCODING = kb._route_encoding()
+    if _ROUTE_ENCODING == "delta":
+        return route.to_delta()
+    return route.to_absolute()
+
+
 def _run_carrier(carrier, mask):
-    route = kb._mask_to_route(mask).for_kernel()
+    route = _route_for_kernel(_mask_to_route_cached(mask))
     output, output_dtype, geometry, strides = kb._attention_geometry(carrier)
     library = kb.load_native_library()
     kb._check_native(
@@ -160,6 +219,44 @@ def _run_carrier(carrier, mask):
     return output[..., :carrier.original_head_dim]
 
 
+def _project_output_chunks(
+    output_hnd, x, heads, q_block_to_original, projection, profiler=None
+):
+    """Project Kitchen output before restoring stock-Wan token order.
+
+    A tokenwise Linear commutes with the block-order permutation. Feed bounded
+    HND slabs directly through self_attn.o and scatter only the projected rows
+    into the final BNC tensor, avoiding a complete pre-o BNC restoration.
+    """
+    batch, q_tokens, channels = x.shape
+    head_dim = channels // heads
+    if tuple(output_hnd.shape[:3]) != (batch, heads, q_tokens):
+        raise RuntimeError("Unexpected projected Kitchen output geometry.")
+    if int(output_hnd.shape[-1]) != head_dim:
+        raise RuntimeError(
+            "Unexpected projected Kitchen output head dimension."
+        )
+
+    marker = profiler.profile_start(x) if profiler else None
+    projected = torch.empty_like(x)
+    for start in range(0, q_tokens, O_PROJ_CHUNK):
+        end = min(start + O_PROJ_CHUNK, q_tokens)
+        current = output_hnd[:, :, start:end].permute(0, 2, 1, 3)
+        if current.dtype != x.dtype:
+            current = current.to(dtype=x.dtype)
+        current = current.reshape(
+            batch, end - start, channels
+        ).contiguous()
+        current = projection(current)
+        projected.index_copy_(
+            1, q_block_to_original[start:end], current
+        )
+        del current
+    if profiler:
+        profiler.profile_end("kitchen_restore_o_proj", marker)
+    return projected
+
+
 def _chronological_slots(cache, block_index):
     slots = cache.entries.get(int(block_index))
     if slots is None:
@@ -186,6 +283,24 @@ def _anchor_positions(total_tokens):
     return tuple(sample * (total_tokens - 1) // 8 for sample in range(9))
 
 
+def _anchor_metadata(total_tokens, device):
+    device = torch.device(device)
+    key = (int(total_tokens), device.type, device.index)
+    cached = _ANCHOR_META_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    positions = _anchor_positions(total_tokens)
+    sample_positions = torch.tensor(
+        positions, dtype=torch.int32, device=device
+    )
+    cached = (positions, sample_positions)
+    if len(_ANCHOR_META_CACHE) >= 16:
+        _ANCHOR_META_CACHE.clear()
+    _ANCHOR_META_CACHE[key] = cached
+    return cached
+
+
 def _select_global_anchor(
     module,
     x,
@@ -200,9 +315,8 @@ def _select_global_anchor(
     head_dim,
 ):
     """Build exactly nine K samples; project only samples from current tokens."""
-    positions = _anchor_positions(
-        len(acquired) * slot_tokens + current_tokens
-    )
+    total_tokens = len(acquired) * slot_tokens + current_tokens
+    positions, sample_positions = _anchor_metadata(total_tokens, x.device)
     samples = []
     device = x.device
     dtype = x.dtype
@@ -231,9 +345,6 @@ def _select_global_anchor(
             del current, projected
 
     samples = torch.cat(samples, dim=2).contiguous()
-    sample_positions = torch.tensor(
-        positions, dtype=torch.int32, device=device
-    )
     values = torch.empty(
         samples.shape[0], heads, head_dim, dtype=dtype, device=device
     )
@@ -251,7 +362,7 @@ def _select_global_anchor(
             kb._ptr(indices),
             samples.shape[0],
             heads,
-            history_tokens + current_tokens,
+            total_tokens,
             head_dim,
             samples.stride(0),
             samples.stride(1),
@@ -715,8 +826,8 @@ def run_projected_kitchen_attention(
 
         output_hnd = _run_carrier(kitchen, mask)
         del mask, anchor_values, kitchen
-        output = backend._restore(
-            output_hnd, x, heads, current_map, profiler=runtime
+        output = _project_output_chunks(
+            output_hnd, x, heads, current_map, module.o, profiler=runtime
         )
         del output_hnd
 
@@ -736,6 +847,6 @@ def run_projected_kitchen_attention(
         del current_k, current_v, current_k_pool, k_sum
 
         runtime.seen_self_attention_blocks.add(block_index)
-        return module.o(output)
+        return output
     finally:
         stack.close()
