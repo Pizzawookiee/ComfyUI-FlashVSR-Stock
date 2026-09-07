@@ -568,6 +568,14 @@ def _commit_compact_pair(
         cached_k, cached_v, _old_summary = (
             cache.entries[int(block_index)][cache.write_slot]
         )
+        summary = (
+            current_summary.to(device="cpu", non_blocking=False).contiguous()
+        )
+        if cache._commit_reused_int8_slot(
+            int(block_index), k_carrier, v_carrier, summary
+        ):
+            cache.committed_blocks.add(int(block_index))
+            return
         cpu_k, cpu_v = _cpu_pair(cache, k_carrier, v_carrier)
         pending = []
         for cached, cpu_value, gpu_source in (
@@ -582,9 +590,7 @@ def _commit_compact_pair(
                 ))
             else:
                 pending.append(cpu_value)
-        pending.append(
-            current_summary.to(device="cpu", non_blocking=False).contiguous()
-        )
+        pending.append(summary)
         cache.pending_entries[int(block_index)] = tuple(pending)
 
     cache.committed_blocks.add(int(block_index))

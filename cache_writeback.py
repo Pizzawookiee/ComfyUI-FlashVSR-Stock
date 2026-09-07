@@ -69,9 +69,14 @@ class AsyncCacheWriter:
         self.cursor = 0
         self.lock = threading.Lock()
         self.host_copy_seconds = 0.0
+        self.sync_copy_seconds = 0.0
         self.enqueues = 0
+        self.sync_submissions = 0
         self.waits = 0
         self.bytes = 0
+        self.reusable_pair = None
+        self.reuse_hits = 0
+        self.reuse_allocations = 0
 
         if not self.enabled:
             self.disabled_reason = "cache source is not CUDA"
@@ -138,25 +143,66 @@ class AsyncCacheWriter:
         if wait_stage:
             self.waits += 1
 
-    def _sync_pair(self, k_value, v_value):
-        outputs = []
-        for value in (k_value, v_value):
-            destination = _empty_cpu_like(value)
+    @staticmethod
+    def _matching_pair(pair, k_value, v_value):
+        if pair is None or len(pair) != 2:
+            return False
+        return (
+            AsyncCacheWriter._matching(
+                _components(pair[0]), _components(k_value)
+            )
+            and AsyncCacheWriter._matching(
+                _components(pair[1]), _components(v_value)
+            )
+        )
+
+    def _allocate_pair(self, k_value, v_value):
+        self.reuse_allocations += 1
+        return _empty_cpu_like(k_value), _empty_cpu_like(v_value)
+
+    def _take_reusable_pair(self, k_value, v_value):
+        pair = self.reusable_pair
+        self.reusable_pair = None
+        if self._matching_pair(pair, k_value, v_value):
+            self.reuse_hits += 1
+            return pair
+        return self._allocate_pair(k_value, v_value)
+
+    def recycle_pair(self, k_value, v_value):
+        """Retain at most one displaced authoritative K/V pair for reuse."""
+        self.reusable_pair = (k_value, v_value)
+
+    def _sync_pair(self, k_value, v_value, destinations=None):
+        if destinations is None:
+            destinations = self._allocate_pair(k_value, v_value)
+        started = time.perf_counter()
+        for value, destination in zip((k_value, v_value), destinations):
             for source, target in zip(
                 _components(value), _components(destination)
             ):
                 target.copy_(source, non_blocking=False)
-            outputs.append(destination)
-        return tuple(outputs)
+        self.sync_copy_seconds += time.perf_counter() - started
+        self.sync_submissions += 1
+        self.bytes += sum(
+            source.numel() * source.element_size()
+            for source in (*_components(k_value), *_components(v_value))
+        )
+        return tuple(destinations)
 
-    def submit_pair(self, k_value, v_value):
+    def submit_pair(self, k_value, v_value, destinations=None):
         """Return ordinary CPU placeholders populated before :meth:`flush`."""
         if not self.enabled:
-            return self._sync_pair(k_value, v_value)
+            return self._sync_pair(k_value, v_value, destinations)
 
         sources = (*_components(k_value), *_components(v_value))
-        cpu_k = _empty_cpu_like(k_value)
-        cpu_v = _empty_cpu_like(v_value)
+        if destinations is None:
+            cpu_k, cpu_v = self._allocate_pair(k_value, v_value)
+        else:
+            cpu_k, cpu_v = destinations
+            if not self._matching_pair(destinations, k_value, v_value):
+                raise RuntimeError(
+                    "FlashVSR reusable CPU cache pair shape/dtype mismatch."
+                )
         destinations = (*_components(cpu_k), *_components(cpu_v))
         slot = self.slots[self.cursor]
         self.cursor = (self.cursor + 1) % self.depth
@@ -176,7 +222,9 @@ class AsyncCacheWriter:
             except Exception as error:
                 self.enabled = False
                 self.disabled_reason = f"pinned staging allocation failed: {error}"
-                return self._sync_pair(k_value, v_value)
+                return self._sync_pair(
+                    k_value, v_value, (cpu_k, cpu_v)
+                )
 
         with torch.cuda.device(self.device):
             ready = torch.cuda.Event()
@@ -208,6 +256,19 @@ class AsyncCacheWriter:
         self.runtime.profile_count("kv_write_bytes", self.bytes, replace=True)
         return cpu_k, cpu_v
 
+    def submit_reused_pair(self, k_value, v_value, recycle_pair):
+        """Write into one reusable scratch pair, then recycle the displaced pair."""
+        destinations = self._take_reusable_pair(k_value, v_value)
+        try:
+            outputs = self.submit_pair(
+                k_value, v_value, destinations=destinations
+            )
+        except Exception:
+            self.reusable_pair = destinations
+            raise
+        self.recycle_pair(*recycle_pair)
+        return outputs
+
     def flush(self):
         if not self.enabled:
             return
@@ -228,10 +289,17 @@ class AsyncCacheWriter:
                 "[FlashVSR] async cache write-through: "
                 f"enqueues={self.enqueues}, waits={self.waits}, "
                 f"transferred={self.bytes / (1024 ** 3):.2f} GiB, "
-                f"host_copy={self.host_copy_seconds * 1000:.1f} ms."
+                f"host_copy={self.host_copy_seconds * 1000:.1f} ms, "
+                f"reuse_hits={self.reuse_hits}, "
+                f"cpu_pair_allocations={self.reuse_allocations}."
             )
         elif self.disabled_reason:
             print(
                 "[FlashVSR] async cache write-through inactive: "
-                f"{self.disabled_reason}; using synchronous CPU copies."
+                f"{self.disabled_reason}; synchronous CPU copies: "
+                f"submissions={self.sync_submissions}, "
+                f"transferred={self.bytes / (1024 ** 3):.2f} GiB, "
+                f"copy={self.sync_copy_seconds * 1000:.1f} ms, "
+                f"reuse_hits={self.reuse_hits}, "
+                f"cpu_pair_allocations={self.reuse_allocations}."
             )

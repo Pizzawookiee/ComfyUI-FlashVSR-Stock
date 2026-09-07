@@ -244,6 +244,7 @@ class FlashVSRKVCache:
         self.reported = False
         self.k_reference_means = {}
         self.async_writer = None
+        self.reuse_updates_active = False
 
     @property
     def enabled(self):
@@ -252,6 +253,7 @@ class FlashVSRKVCache:
     def configure(self, mode, total_blocks, cache_format="int8",
                   residency_backend="cpu"):
         self.clear()
+        self.reuse_updates_active = False
         self.mode = mode
         self.cache_format = str(cache_format)
         self.residency_backend = str(residency_backend)
@@ -290,6 +292,11 @@ class FlashVSRKVCache:
         return int(block_index) in self.active_blocks
 
     def begin_chunk(self, initial):
+        if self.reuse_updates_active:
+            raise RuntimeError(
+                "FlashVSR KV cache cannot continue after an incomplete "
+                "reusable-buffer continuation; reset the workflow/cache."
+            )
         self.initial_chunk = bool(initial)
         self.committed_blocks.clear()
         self.pending_entries = {}
@@ -311,6 +318,13 @@ class FlashVSRKVCache:
             self.async_writer.flush()
         if self.initial_chunk:
             self.entries = self.pending_entries
+        elif self.reuse_updates_active:
+            if self.pending_entries:
+                raise RuntimeError(
+                    "FlashVSR reusable CPU cache path mixed immediate and "
+                    "deferred continuation commits."
+                )
+            self.reuse_updates_active = False
         else:
             for block_index, pending in self.pending_entries.items():
                 committed = []
@@ -351,6 +365,55 @@ class FlashVSRKVCache:
             carrier.dtype,
             carrier.head_dim,
         )
+
+    @staticmethod
+    def _cpu_backing(cached):
+        if is_aimdo_value(cached):
+            return cached.cpu_value
+        return cached
+
+    def _commit_reused_int8_slot(
+        self, block_index, gpu_k, gpu_v, summary
+    ):
+        """Commit one continuation slot using only one extra CPU K/V pair.
+
+        The old slot has already been consumed by this Wan block. Its CPU
+        backing becomes the writer's scratch pair for the following block.
+        Because prior blocks are updated immediately, an interrupted model
+        call is fail-closed by ``reuse_updates_active`` rather than rolled back.
+        """
+        if self.cache_format != "int8" or self.async_writer is None:
+            return False
+        block_index = int(block_index)
+        # From this point onward the continuation may recycle backing that
+        # belongs to the currently authoritative generation. Any exception
+        # must therefore make the cache unusable until it is reset.
+        self.reuse_updates_active = True
+        cached_k, cached_v, _old_summary = (
+            self.entries[block_index][self.write_slot]
+        )
+        old_cpu_pair = (
+            self._cpu_backing(cached_k), self._cpu_backing(cached_v)
+        )
+        cpu_k, cpu_v = self.async_writer.submit_reused_pair(
+            gpu_k, gpu_v, recycle_pair=old_cpu_pair
+        )
+
+        committed = []
+        for cached, cpu_value, gpu_source in (
+            (cached_k, cpu_k, gpu_k),
+            (cached_v, cpu_v, gpu_v),
+        ):
+            if is_aimdo_value(cached):
+                update = cached.prepare_update(cpu_value, gpu_source)
+                cached.commit_update(update)
+                committed.append(cached)
+            else:
+                committed.append(cpu_value)
+        self.entries[block_index][self.write_slot] = (
+            committed[0], committed[1], summary
+        )
+        return True
 
     def _make_gpu_value(self, source, value_kind, heads):
         compact = (
@@ -797,15 +860,20 @@ class FlashVSRKVCache:
             )
             gpu_k = self._make_gpu_value(k, "k", heads)
             gpu_v = self._make_gpu_value(v, "v", heads)
+            summary = (
+                self._make_k_summary(k, heads, tokens_per_frame)
+                if self.cache_format == "int8" else None
+            )
+            if self._commit_reused_int8_slot(
+                block_index, gpu_k, gpu_v, summary
+            ):
+                self.committed_blocks.add(block_index)
+                return
             if self.async_writer is not None and self.cache_format == "int8":
                 cpu_k, cpu_v = self.async_writer.submit_pair(gpu_k, gpu_v)
             else:
                 cpu_k = self._carrier_to(gpu_k, torch.device("cpu"))
                 cpu_v = self._carrier_to(gpu_v, torch.device("cpu"))
-            summary = (
-                self._make_k_summary(k, heads, tokens_per_frame)
-                if self.cache_format == "int8" else None
-            )
             pending = []
             for cached, cpu_value, gpu_source in (
                 (cached_k, cpu_k, gpu_k),
