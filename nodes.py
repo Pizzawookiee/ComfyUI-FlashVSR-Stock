@@ -559,7 +559,7 @@ class FlashVSRTCDecode:
                 latent_std=latent_format.latents_std,
                 latent_scale_factor=latent_format.scale_factor,
                 output_device=model_management.intermediate_device(),
-                output_dtype=torch.float32,
+                output_dtype=torch.float16,
                 output_chunk_size=output_chunk_size,
                 temporal_batch_size=temporal_batch_size,
                 frame_start=video.crop_start,
